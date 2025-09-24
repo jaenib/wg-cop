@@ -23,20 +23,47 @@ logger = logging.getLogger(__name__)
 from config import TOKEN
 from config import GROUP_CHAT_ID
 from config import BOT_HANDLER_ID
+from config import CHRONICLER_ID
 
 # Data storage
 DATA_FILE = "wg_data_beta.json"
 
 
+def _get_chronicler_chat_id():
+    if not CHRONICLER_ID:
+        return None
+
+    chronicler_chat_id = str(CHRONICLER_ID).strip()
+    if not chronicler_chat_id or chronicler_chat_id == "your_chronicler_chatid":
+        return None
+
+    return chronicler_chat_id
+
+
 def load_data():
     try:
         with open(DATA_FILE, "r") as file:
-            return json.load(file)
+            data = json.load(file)
     except (FileNotFoundError, json.JSONDecodeError):
-        default_data = {"expenses": [], "chores": {}, "penalties": {}, "members": []}
+        default_data = {
+            "expenses": [],
+            "chores": {},
+            "penalties": {},
+            "members": [],
+            "chronicler_backup": {"greeting_sent": False, "last_sent": None},
+        }
         with open(DATA_FILE, "w") as file:
             json.dump(default_data, file, indent=4)
         return default_data
+
+    if "chronicler_backup" not in data:
+        data["chronicler_backup"] = {
+            "greeting_sent": False,
+            "last_sent": None,
+        }
+        save_data(data)
+
+    return data
 
 
 def save_data(data):
@@ -531,6 +558,92 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
         logger.error(f"Failed to send weekly report: {e}")
 
 
+def _get_chronicler_meta(data):
+    return data.setdefault(
+        "chronicler_backup",
+        {"greeting_sent": False, "last_sent": None},
+    )
+
+
+async def send_initial_chronicler_backup(context: CallbackContext) -> None:
+    chronicler_chat_id = _get_chronicler_chat_id()
+    if not chronicler_chat_id:
+        logger.info("Chronicler ID is not configured; skipping initial backup dispatch.")
+        return
+
+    data = load_data()
+    backup_meta = _get_chronicler_meta(data)
+
+    if backup_meta.get("greeting_sent"):
+        return
+
+    greeting = (
+        "Greetings, Chronicler! You have been entrusted with safeguarding our household's "
+        "history. Here is the first archive snapshot for your special role."
+    )
+
+    try:
+        await context.bot.send_message(chat_id=chronicler_chat_id, text=greeting)
+        with open(DATA_FILE, "rb") as doc:
+            await context.bot.send_document(
+                chat_id=chronicler_chat_id,
+                document=doc,
+                filename=DATA_FILE,
+                caption="Initial archive dispatch",
+            )
+    except (FileNotFoundError, TelegramError) as e:
+        logger.error(f"Failed to deliver initial backup to chronicler: {e}")
+        return
+
+    backup_meta["greeting_sent"] = True
+    backup_meta["last_sent"] = datetime.now(pytz.timezone("Europe/Berlin")).isoformat()
+    save_data(data)
+
+
+async def send_chronicler_backup(context: CallbackContext) -> None:
+    chronicler_chat_id = _get_chronicler_chat_id()
+    if not chronicler_chat_id:
+        logger.info("Chronicler ID is not configured; skipping scheduled backup dispatch.")
+        return
+
+    data = load_data()
+    backup_meta = _get_chronicler_meta(data)
+
+    try:
+        with open(DATA_FILE, "rb") as doc:
+            await context.bot.send_document(
+                chat_id=chronicler_chat_id,
+                document=doc,
+                filename=DATA_FILE,
+                caption="Weekly archive backup",
+            )
+    except (FileNotFoundError, TelegramError) as e:
+        logger.error(f"Failed to send chronicler backup: {e}")
+        return
+
+    backup_meta["last_sent"] = datetime.now(pytz.timezone("Europe/Berlin")).isoformat()
+    save_data(data)
+
+
+def setup_chronicler_backup_job(application):
+    if not _get_chronicler_chat_id():
+        logger.info("Chronicler ID is not configured; chronicler backup jobs will not be scheduled.")
+        return
+
+    interval = timedelta(days=7).total_seconds()
+    application.job_queue.run_repeating(
+        send_chronicler_backup,
+        interval=interval,
+        first=interval,
+        name="chronicler_backup",
+    )
+    application.job_queue.run_once(
+        send_initial_chronicler_backup,
+        when=0,
+        name="chronicler_initial_backup",
+    )
+
+
 def setup_weekly_job(application):
     target_time = datetime.now(pytz.timezone("Europe/Berlin"))
     target_time = target_time.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -665,6 +778,7 @@ def main():
     app.add_handler(chore_conv)
 
     setup_weekly_job(app)
+    setup_chronicler_backup_job(app)
     app.job_queue.run_repeating(
         send_alive,
         interval=timedelta(hours=4).total_seconds(),
