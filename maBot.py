@@ -1,5 +1,8 @@
 import json
 import logging
+import os
+import re
+import tempfile
 import pytz
 from datetime import datetime, timedelta
 
@@ -12,6 +15,16 @@ from telegram.ext import (
     ConversationHandler, CallbackQueryHandler,
 )
 from telegram.error import TelegramError
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - optional dependency
+    Image = None
+
+try:
+    import pytesseract
+except ImportError:  # pragma: no cover - optional dependency
+    pytesseract = None
 
 # Set up logging
 logging.basicConfig(
@@ -71,20 +84,38 @@ def save_data(data):
         json.dump(data, file, indent=4)
 
 
+class ReceiptParsingError(Exception):
+    """Raised when a receipt image cannot be parsed for line items."""
+
+
 # Callback data prefixes
 CB_PAYER_PREFIX = "payer:"
 CB_SPLIT_TOGGLE_PREFIX = "split_toggle:"
 CB_SPLIT_DONE = "split_done"
 CB_SPLIT_BACK = "split_back"
 CB_SPLIT_CANCEL = "split_cancel"
+CB_RECEIPT_TOGGLE_PREFIX = "receipt_toggle:"
+CB_RECEIPT_DONE = "receipt_done"
+CB_RECEIPT_CANCEL = "receipt_cancel"
 
 # Settings
 EXPENSE_LIST_LIMIT = 20
 
 # States for conversation handler
-EXPENSE_DESCRIPTION, EXPENSE_AMOUNT, EXPENSE_PAYER, EXPENSE_SPLIT = range(4)
+(
+    EXPENSE_MODE,
+    EXPENSE_DESCRIPTION,
+    EXPENSE_AMOUNT,
+    EXPENSE_PAYER,
+    EXPENSE_SPLIT,
+    EXPENSE_RECEIPT,
+    EXPENSE_RECEIPT_REVIEW,
+    EXPENSE_RECEIPT_MANUAL,
+) = range(8)
 CHORE_USER, CHORE_MINUTES = range(2)
 MANAGE_MEMBER = range(1)
+
+RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 
 
 # Dynamic Keyboards
@@ -116,6 +147,12 @@ def get_member_keyboard(data):
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
+def _truncate_button_label(label: str, limit: int = 60) -> str:
+    if len(label) <= limit:
+        return label
+    return label[: limit - 1] + "…"
+
+
 def build_payer_inline_kb(members):
     rows = [[InlineKeyboardButton(m, callback_data=f"{CB_PAYER_PREFIX}{m}")] for m in members]
     return InlineKeyboardMarkup(rows)
@@ -137,6 +174,88 @@ def build_split_inline_kb(members, selected):
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def build_receipt_items_text(items, selected):
+    lines = ["Toggle items to exclude them from the shared expense:"]
+    total = 0.0
+    for idx, item in enumerate(items):
+        picked = idx in selected
+        marker = "✅" if picked else "🚫"
+        lines.append(
+            f"{marker} {item['name']} — {item['amount']:.2f}"
+        )
+        if picked:
+            total += item["amount"]
+    lines.append("")
+    lines.append(f"Current shared total: {total:.2f}")
+    return "\n".join(lines)
+
+
+def build_receipt_items_kb(items, selected):
+    rows = []
+    for idx, item in enumerate(items):
+        picked = idx in selected
+        marker = "✅" if picked else "🚫"
+        label = _truncate_button_label(
+            f"{marker} {item['name']} ({item['amount']:.2f})"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"{CB_RECEIPT_TOGGLE_PREFIX}{idx}"
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("✅ Done", callback_data=CB_RECEIPT_DONE),
+            InlineKeyboardButton("✖️ Cancel", callback_data=CB_RECEIPT_CANCEL),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _parse_line_item(line: str):
+    clean = line.strip()
+    if not clean:
+        return None
+    match = re.search(r"(-?\d+[.,]\d{1,2})", clean)
+    if not match:
+        return None
+    amount_raw = match.group(1)
+    try:
+        amount = round(float(amount_raw.replace(",", ".")), 2)
+    except ValueError:
+        return None
+    name = clean[: match.start()].strip(" :-–—\t")
+    if not name:
+        name = "Item"
+    return {"name": name, "amount": amount}
+
+
+def parse_receipt_text(text: str):
+    items = []
+    for line in text.splitlines():
+        parsed = _parse_line_item(line)
+        if parsed:
+            items.append(parsed)
+    return items
+
+
+def extract_items_from_receipt(image_path: str):
+    if not pytesseract or not Image:
+        raise ReceiptParsingError("OCR dependencies are not installed.")
+    try:
+        with Image.open(image_path) as img:
+            text = pytesseract.image_to_string(img)
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        raise ReceiptParsingError("Failed to read the receipt image.") from exc
+
+    items = parse_receipt_text(text)
+    if not items:
+        raise ReceiptParsingError("No line items recognised in the receipt.")
+    return items
 
 
 async def start(update: Update, context: CallbackContext) -> None:
@@ -191,13 +310,74 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
 
 
 # Expense flow
+
+
+async def _prompt_for_payer(message, context: CallbackContext) -> int:
+    data = load_data()
+    if not data.get("members"):
+        context.user_data.clear()
+        await message.reply_text(
+            "No members found. Please add members first.",
+            reply_markup=get_main_keyboard(),
+        )
+        return ConversationHandler.END
+
+    await message.reply_text("Who paid?", reply_markup=ReplyKeyboardRemove())
+    await message.reply_html(
+        "<b>Select payer:</b>",
+        reply_markup=build_payer_inline_kb(data["members"]),
+    )
+    return EXPENSE_PAYER
+
+
 async def start_expense(update: Update, context: CallbackContext) -> int:
     context.user_data.clear()
-    await update.message.reply_text(
-        "Enter a short description for the expense (e.g., 'Groceries Migros'):",
-        reply_markup=ReplyKeyboardRemove(),
+    context.user_data["mode"] = None
+    keyboard = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Manual Entry")],
+            [KeyboardButton("Scan Receipt")],
+            [KeyboardButton("Cancel")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
-    return EXPENSE_DESCRIPTION
+    await update.message.reply_text(
+        "How would you like to add the expense?",
+        reply_markup=keyboard,
+    )
+    return EXPENSE_MODE
+
+
+async def expense_mode_selection(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    lowered = text.lower()
+
+    if lowered == "manual entry":
+        context.user_data["mode"] = "manual"
+        await update.message.reply_text(
+            "Enter a short description for the expense (e.g., 'Groceries Migros'):",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EXPENSE_DESCRIPTION
+
+    if lowered == "scan receipt":
+        context.user_data["mode"] = "receipt"
+        await update.message.reply_text(
+            "Please send a photo or image of the receipt. I'll try to read the line items.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EXPENSE_RECEIPT
+
+    if lowered == "cancel":
+        return await cancel(update, context)
+
+    context.user_data["mode"] = "manual"
+    context.user_data["description"] = text
+    await update.message.reply_text(
+        "Enter the amount (e.g. 42.50):", reply_markup=ReplyKeyboardRemove()
+    )
+    return EXPENSE_AMOUNT
 
 
 async def expense_description(update: Update, context: CallbackContext) -> int:
@@ -206,6 +386,10 @@ async def expense_description(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("Please provide a non-empty description.")
         return EXPENSE_DESCRIPTION
     context.user_data["description"] = desc
+    mode = context.user_data.get("mode", "manual")
+    if mode == "receipt" and context.user_data.get("amount") is not None:
+        return await _prompt_for_payer(update.message, context)
+
     await update.message.reply_text("Enter the amount (e.g. 42.50):")
     return EXPENSE_AMOUNT
 
@@ -219,20 +403,160 @@ async def expense_amount(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("Invalid amount. Try again (e.g. 42.50).")
         return EXPENSE_AMOUNT
 
-    data = load_data()
-    if not data.get("members"):
+    context.user_data.setdefault("mode", "manual")
+    return await _prompt_for_payer(update.message, context)
+
+
+async def expense_receipt_photo(update: Update, context: CallbackContext) -> int:
+    telegram_file = None
+    if update.message.photo:
+        telegram_file = await update.message.photo[-1].get_file()
+    elif update.message.document:
+        telegram_file = await update.message.document.get_file()
+
+    if not telegram_file:
         await update.message.reply_text(
-            "No members found. Please add members first.",
-            reply_markup=get_main_keyboard(),
+            "Please send a photo or image of the receipt, or type Cancel to abort."
+        )
+        return EXPENSE_RECEIPT
+
+    tmp_path = None
+    items = []
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp_path = tmp.name
+        await telegram_file.download_to_drive(tmp_path)
+
+        try:
+            items = extract_items_from_receipt(tmp_path)
+        except ReceiptParsingError as exc:
+            logger.info("Receipt OCR failed: %s", exc)
+            await update.message.reply_text(
+                "I couldn't read the receipt automatically."
+                "\nPlease send the items as text in the format 'Item - price',"
+                " one per line."
+            )
+            return EXPENSE_RECEIPT_MANUAL
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    if not items:
+        await update.message.reply_text(
+            "I couldn't find any purchasable items. Please send them as text, one per line."
+        )
+        return EXPENSE_RECEIPT_MANUAL
+
+    context.user_data["mode"] = "receipt"
+    context.user_data["receipt_items"] = items
+    context.user_data["receipt_selected"] = set(range(len(items)))
+
+    await update.message.reply_text(
+        build_receipt_items_text(items, context.user_data["receipt_selected"]),
+        reply_markup=build_receipt_items_kb(
+            items, context.user_data["receipt_selected"]
+        ),
+    )
+    return EXPENSE_RECEIPT_REVIEW
+
+
+async def expense_receipt_invalid(update: Update, context: CallbackContext) -> int:
+    await update.message.reply_text(
+        "Please send a photo or image of the receipt, or type Cancel to abort."
+    )
+    return EXPENSE_RECEIPT
+
+
+async def expense_receipt_manual_items(update: Update, context: CallbackContext) -> int:
+    raw = update.message.text or ""
+    items = parse_receipt_text(raw)
+    if not items:
+        await update.message.reply_text(
+            "I couldn't understand any items. Use lines like 'Bread - 3.50'."
+        )
+        return EXPENSE_RECEIPT_MANUAL
+
+    context.user_data["mode"] = "receipt"
+    context.user_data["receipt_items"] = items
+    context.user_data["receipt_selected"] = set(range(len(items)))
+
+    await update.message.reply_text(
+        build_receipt_items_text(items, context.user_data["receipt_selected"]),
+        reply_markup=build_receipt_items_kb(
+            items, context.user_data["receipt_selected"]
+        ),
+    )
+    return EXPENSE_RECEIPT_REVIEW
+
+
+async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    items = context.user_data.get("receipt_items", [])
+    if not items:
+        await query.edit_message_text("No items to review. Please send the receipt again.")
+        return EXPENSE_RECEIPT
+
+    selected = context.user_data.get(
+        "receipt_selected", set(range(len(items)))
+    )
+    if not isinstance(selected, set):
+        selected = set(selected)
+
+    if query.data == CB_RECEIPT_CANCEL:
+        context.user_data.clear()
+        await query.edit_message_text("Receipt-based expense cancelled.")
+        await query.message.reply_text(
+            "Cancelled. Back to main menu.", reply_markup=get_main_keyboard()
         )
         return ConversationHandler.END
 
-    await update.message.reply_text("Who paid?", reply_markup=ReplyKeyboardRemove())
-    await update.message.reply_html(
-        "<b>Select payer:</b>",
-        reply_markup=build_payer_inline_kb(data["members"]),
-    )
-    return EXPENSE_PAYER
+    if query.data == CB_RECEIPT_DONE:
+        if not selected:
+            await query.answer("Select at least one item.", show_alert=True)
+            return EXPENSE_RECEIPT_REVIEW
+
+        chosen = [items[i] for i in sorted(selected)]
+        total = round(sum(item["amount"] for item in chosen), 2)
+        context.user_data["selected_items"] = chosen
+        context.user_data["amount"] = total
+
+        lines = ["Selected items:"]
+        for item in chosen:
+            lines.append(f"• {item['name']} — {item['amount']:.2f}")
+        lines.append("")
+        lines.append(f"Shared subtotal: {total:.2f}")
+
+        await query.edit_message_text("\n".join(lines))
+        await query.message.reply_text(
+            "Enter a short description for these items:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EXPENSE_DESCRIPTION
+
+    if query.data.startswith(CB_RECEIPT_TOGGLE_PREFIX):
+        try:
+            idx = int(query.data[len(CB_RECEIPT_TOGGLE_PREFIX) :])
+        except ValueError:
+            logger.warning("Invalid receipt toggle index: %s", query.data)
+            return EXPENSE_RECEIPT_REVIEW
+
+        if 0 <= idx < len(items):
+            if idx in selected:
+                selected.remove(idx)
+            else:
+                selected.add(idx)
+            context.user_data["receipt_selected"] = selected
+
+        await query.edit_message_text(
+            build_receipt_items_text(items, selected),
+            reply_markup=build_receipt_items_kb(items, selected),
+        )
+        return EXPENSE_RECEIPT_REVIEW
+
+    return EXPENSE_RECEIPT_REVIEW
 
 
 async def expense_payer_cb(update: Update, context: CallbackContext) -> int:
@@ -287,15 +611,17 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
         today = datetime.now().strftime("%Y-%m-%d")
 
         db = load_data()
-        db["expenses"].append(
-            {
-                "date": today,
-                "description": desc,
-                "amount": amount,
-                "payer": payer,
-                "split_with": selected,
-            }
-        )
+        entry = {
+            "date": today,
+            "description": desc,
+            "amount": amount,
+            "payer": payer,
+            "split_with": selected,
+        }
+        selected_items = context.user_data.get("selected_items")
+        if selected_items:
+            entry["items"] = selected_items
+        db["expenses"].append(entry)
         save_data(db)
 
         await query.edit_message_text(
@@ -303,6 +629,7 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
             f"Payer: {payer}\nSplit with: {', '.join(selected)}"
         )
         await query.message.reply_text("Done ✅", reply_markup=get_main_keyboard())
+        context.user_data.clear()
         return ConversationHandler.END
 
     if query.data.startswith(CB_SPLIT_TOGGLE_PREFIX):
@@ -381,9 +708,14 @@ async def list_expenses(update: Update, context: CallbackContext) -> None:
         amt = e.get("amount", 0.0)
         payer = e.get("payer", "?")
         split = ", ".join(e.get("split_with", [])) or "-"
-        lines.append(
-            f"{date} — {desc} — {amt:.2f}€ | Payer: {payer} | Split: {split}"
-        )
+        base = f"{date} — {desc} — {amt:.2f}€ | Payer: {payer} | Split: {split}"
+        if e.get("items"):
+            item_summary = ", ".join(
+                f"{item.get('name', 'Item')} ({float(item.get('amount', 0.0)):.2f})"
+                for item in e.get("items", [])
+            )
+            base += f" | Items: {item_summary}"
+        lines.append(base)
     text = "Recent Expenses:\n" + "\n".join(lines)
     await update.message.reply_text(text, reply_markup=get_main_keyboard())
 
@@ -677,6 +1009,7 @@ async def send_alive(context: CallbackContext) -> None:
 
 
 async def cancel(update: Update, context: CallbackContext) -> int:
+    context.user_data.clear()
     await update.message.reply_text(
         "Cancelled. Back to main menu.", reply_markup=get_main_keyboard()
     )
@@ -684,6 +1017,7 @@ async def cancel(update: Update, context: CallbackContext) -> int:
 
 
 async def on_timeout(update: Update, context: CallbackContext) -> int:
+    context.user_data.clear()
     chat = update.effective_chat
     if chat:
         await context.bot.send_message(
@@ -711,11 +1045,29 @@ def main():
     expense_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Expense$"), start_expense)],
         states={
+            EXPENSE_MODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_mode_selection)
+            ],
             EXPENSE_DESCRIPTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_description)
             ],
             EXPENSE_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_amount)
+            ],
+            EXPENSE_RECEIPT: [
+                MessageHandler(RECEIPT_IMAGE_FILTER, expense_receipt_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_invalid),
+            ],
+            EXPENSE_RECEIPT_MANUAL: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, expense_receipt_manual_items
+                )
+            ],
+            EXPENSE_RECEIPT_REVIEW: [
+                CallbackQueryHandler(
+                    receipt_items_cb,
+                    pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel)$",
+                )
             ],
             EXPENSE_PAYER: [
                 CallbackQueryHandler(expense_payer_cb, pattern=f"^{CB_PAYER_PREFIX}")
