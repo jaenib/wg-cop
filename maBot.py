@@ -216,30 +216,102 @@ def build_receipt_items_kb(items, selected):
     return InlineKeyboardMarkup(rows)
 
 
+_LINE_ITEM_AMOUNT_RE = re.compile(r"(-?\d+[.,]\d{1,2})")
+_COLUMN_TOKEN_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
+_HEADER_MARKERS = re.compile(r"\bartikel\b", re.IGNORECASE)
+_STOP_MARKERS = re.compile(r"\b(total|summe|gesamt)\b", re.IGNORECASE)
+_COLUMN_WORDS = {"aktion", "ak", "chf"}
+
+
+def _looks_like_column_token(token: str) -> bool:
+    stripped = token.strip(" :-–—")
+    if not stripped:
+        return True
+    lower = stripped.lower()
+    if _COLUMN_TOKEN_RE.fullmatch(stripped):
+        return True
+    if lower in _COLUMN_WORDS:
+        return True
+    if len(stripped) == 1 and stripped.isalpha() and stripped.isupper():
+        return True
+    return False
+
+
+def _normalise_receipt_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip()
+
+
 def _parse_line_item(line: str):
-    clean = line.strip()
+    clean = _normalise_receipt_line(line)
     if not clean:
         return None
-    match = re.search(r"(-?\d+[.,]\d{1,2})", clean)
-    if not match:
+
+    matches = list(_LINE_ITEM_AMOUNT_RE.finditer(clean))
+    if not matches:
         return None
-    amount_raw = match.group(1)
+
+    amount_match = matches[-1]
+    amount_raw = amount_match.group(1)
     try:
         amount = round(float(amount_raw.replace(",", ".")), 2)
     except ValueError:
         return None
-    name = clean[: match.start()].strip(" :-–—\t")
-    if not name:
-        name = "Item"
+
+    name_part = clean[: amount_match.start()].strip()
+    if not name_part:
+        return None
+
+    tokens = name_part.split()
+    while tokens and _looks_like_column_token(tokens[-1]):
+        tokens.pop()
+
+    name = " ".join(tokens).strip(" :-–—")
+    if len(name) < 2 or sum(ch.isalpha() for ch in name) < 2:
+        return None
+
     return {"name": name, "amount": amount}
 
 
 def parse_receipt_text(text: str):
+    raw_lines = [ln.rstrip() for ln in text.splitlines()]
     items = []
-    for line in text.splitlines():
-        parsed = _parse_line_item(line)
+
+    start_idx = 0
+    for idx, line in enumerate(raw_lines):
+        if _HEADER_MARKERS.search(line):
+            start_idx = idx + 1
+            break
+
+    relevant_lines = []
+    for line in raw_lines[start_idx:]:
+        if _STOP_MARKERS.search(line):
+            break
+        if not line.strip():
+            continue
+        lower_line = line.lower()
+        if (
+            not any(ch.isdigit() for ch in lower_line)
+            and any(word in lower_line for word in ("menge", "preis", "aktion", "mwst", "vat"))
+        ):
+            continue
+        relevant_lines.append(line)
+
+    buffer = ""
+    for line in relevant_lines:
+        candidate = f"{buffer} {line}".strip() if buffer else line
+        parsed = _parse_line_item(candidate)
         if parsed:
             items.append(parsed)
+            buffer = ""
+            continue
+
+        buffer = candidate
+
+    if buffer:
+        parsed = _parse_line_item(buffer)
+        if parsed:
+            items.append(parsed)
+
     return items
 
 
