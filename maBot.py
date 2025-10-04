@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import html
 import pytz
 from datetime import datetime, timedelta
 
@@ -84,6 +85,108 @@ def save_data(data):
         json.dump(data, file, indent=4)
 
 
+def _normalise_member_name(name: str) -> str:
+    return name.strip().casefold() if name else ""
+
+
+def _match_member_name(members, candidate):
+    candidate_norm = _normalise_member_name(candidate)
+    for member in members:
+        if _normalise_member_name(member) == candidate_norm:
+            return member
+    return None
+
+
+def calculate_balances(data):
+    members = data.get("members", []) or []
+    balances = {member: 0.0 for member in members}
+
+    for expense in data.get("expenses", []) or []:
+        amount = float(expense.get("amount", 0.0) or 0.0)
+        payer = _match_member_name(members, expense.get("payer"))
+        split_with = []
+        for participant in expense.get("split_with", []) or []:
+            matched = _match_member_name(members, participant)
+            if matched:
+                split_with.append(matched)
+
+        if not split_with:
+            continue
+
+        share = amount / len(split_with)
+
+        if payer:
+            balances[payer] = balances.get(payer, 0.0) + amount
+
+        for participant in split_with:
+            balances[participant] = balances.get(participant, 0.0) - share
+
+    return balances
+
+
+def _format_currency(amount: float) -> str:
+    return f"CHF {amount:.2f}"
+
+
+def _format_signed_currency(amount: float) -> str:
+    sign = "+" if amount >= 0 else ""
+    return f"CHF {sign}{amount:.2f}"
+
+
+def _resolve_member_for_user(user, members):
+    if not user:
+        return None
+
+    candidates = []
+    if user.full_name:
+        candidates.append(user.full_name)
+    if user.first_name:
+        candidates.append(user.first_name)
+    if user.last_name:
+        candidates.append(user.last_name)
+    if user.username:
+        candidates.append(user.username)
+
+    for candidate in candidates:
+        match = _match_member_name(members, candidate)
+        if match:
+            return match
+    return None
+
+
+def _find_last_expense_for_payer(expenses, payer_name):
+    target = _normalise_member_name(payer_name)
+    for idx in range(len(expenses) - 1, -1, -1):
+        entry = expenses[idx]
+        if _normalise_member_name(entry.get("payer")) == target:
+            return idx, entry
+    return None, None
+
+
+async def _initiate_edit_for_member(message, context, member_name, data=None):
+    data = data or load_data()
+    expenses = data.get("expenses", []) or []
+    idx, entry = _find_last_expense_for_payer(expenses, member_name)
+
+    if entry is None:
+        await message.reply_text(
+            f"No expenses found for {member_name}.", reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
+
+    context.user_data["edit_member"] = member_name
+    context.user_data["edit_index"] = idx
+
+    summary = _format_expense_entry(entry, member_name)
+    prompt = (
+        f"Last expense for {html.escape(member_name)}:\n\n"
+        f"{summary}\n\nWhat do you want to edit?"
+    )
+
+    await message.reply_html(prompt, reply_markup=get_edit_choice_keyboard())
+    return EDIT_MENU
+
+
 class ReceiptParsingError(Exception):
     """Raised when a receipt image cannot be parsed for line items."""
 
@@ -114,6 +217,7 @@ EXPENSE_LIST_LIMIT = 20
 ) = range(8)
 CHORE_USER, CHORE_MINUTES = range(2)
 MANAGE_MEMBER = range(1)
+EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 
@@ -122,17 +226,9 @@ RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [
-                KeyboardButton("Add Expense"),
-                KeyboardButton("Add Chore"),
-                KeyboardButton("List Expenses"),
-            ],
-            [
-                KeyboardButton("Standings"),
-                KeyboardButton("Check Beer Owed"),
-                KeyboardButton("Manage Members"),
-            ],
-            [KeyboardButton("Set Weekly Report"), KeyboardButton("Cancel")],
+            [KeyboardButton("Add Expense"), KeyboardButton("Add Chore")],
+            [KeyboardButton("List Expenses"), KeyboardButton("Standings")],
+            [KeyboardButton("Check Beer Owed"), KeyboardButton("Settings")],
         ],
         resize_keyboard=True,
     )
@@ -145,6 +241,41 @@ def get_member_keyboard(data):
     buttons = [[KeyboardButton(member)] for member in members]
     buttons.append([KeyboardButton("Done")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+
+def get_settings_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Manage Members")],
+            [KeyboardButton("Edit Entries")],
+            [KeyboardButton("Set Weekly Report")],
+            [KeyboardButton("Back to Main Menu")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_edit_choice_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Amount")],
+            [KeyboardButton("Slitters")],
+            [KeyboardButton("Cancel")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def open_settings(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text(
+        "Settings menu:", reply_markup=get_settings_keyboard()
+    )
+
+
+async def settings_back(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text(
+        "Main menu ready.", reply_markup=get_main_keyboard()
+    )
 
 
 def _truncate_button_label(label: str, limit: int = 60) -> str:
@@ -162,15 +293,16 @@ def build_split_inline_kb(members, selected):
     rows = []
     for m in members:
         picked = m in selected
-        label = f"{'✅ ' if picked else ''}{m}"
+        prefix = "[x] " if picked else "[ ] "
+        label = f"{prefix}{m}"
         rows.append(
             [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{m}")]
         )
     rows.append(
         [
-            InlineKeyboardButton("⬅️ Back", callback_data=CB_SPLIT_BACK),
-            InlineKeyboardButton("✅ Done", callback_data=CB_SPLIT_DONE),
-            InlineKeyboardButton("✖️ Cancel", callback_data=CB_SPLIT_CANCEL),
+            InlineKeyboardButton("Back", callback_data=CB_SPLIT_BACK),
+            InlineKeyboardButton("Done", callback_data=CB_SPLIT_DONE),
+            InlineKeyboardButton("Cancel", callback_data=CB_SPLIT_CANCEL),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -181,7 +313,7 @@ def build_receipt_items_text(items, selected):
     total = 0.0
     for idx, item in enumerate(items):
         picked = idx in selected
-        marker = "✅" if picked else "🚫"
+        marker = "[x]" if picked else "[ ]"
         lines.append(
             f"{marker} {item['name']} — {item['amount']:.2f}"
         )
@@ -196,7 +328,7 @@ def build_receipt_items_kb(items, selected):
     rows = []
     for idx, item in enumerate(items):
         picked = idx in selected
-        marker = "✅" if picked else "🚫"
+        marker = "[x]" if picked else "[ ]"
         label = _truncate_button_label(
             f"{marker} {item['name']} ({item['amount']:.2f})"
         )
@@ -209,8 +341,8 @@ def build_receipt_items_kb(items, selected):
         )
     rows.append(
         [
-            InlineKeyboardButton("✅ Done", callback_data=CB_RECEIPT_DONE),
-            InlineKeyboardButton("✖️ Cancel", callback_data=CB_RECEIPT_CANCEL),
+            InlineKeyboardButton("Done", callback_data=CB_RECEIPT_DONE),
+            InlineKeyboardButton("Cancel", callback_data=CB_RECEIPT_CANCEL),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -640,7 +772,7 @@ async def expense_payer_cb(update: Update, context: CallbackContext) -> int:
         context.user_data["payer"] = payer
         context.user_data["split_with"] = set()
         await query.edit_message_text(
-            "Select who shares the expense (toggle). Then press ✅ Done."
+            "Select who shares the expense (toggle). Then press Done."
         )
         await query.message.reply_text(
             "Split with:",
@@ -672,7 +804,7 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
 
     if query.data == CB_SPLIT_DONE:
-        selected = list(context.user_data.get("split_with", []))
+        selected = sorted(context.user_data.get("split_with", []))
         if not selected:
             await query.answer("Select at least one person.", show_alert=True)
             return EXPENSE_SPLIT
@@ -696,11 +828,41 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
         db["expenses"].append(entry)
         save_data(db)
 
-        await query.edit_message_text(
-            f"Added expense: {today} — {desc} — {amount:.2f}€\n"
-            f"Payer: {payer}\nSplit with: {', '.join(selected)}"
+        payer_norm = _normalise_member_name(payer)
+        share_count = len(selected)
+        share = amount / share_count if share_count else 0.0
+        owed_total = share * sum(
+            1 for name in selected if _normalise_member_name(name) != payer_norm
         )
-        await query.message.reply_text("Done ✅", reply_markup=get_main_keyboard())
+
+        members = db.get("members", []) or []
+        payer_key = _match_member_name(members, payer)
+        balances = calculate_balances(db)
+        payer_balance = balances.get(payer_key)
+
+        confirmation_lines = [
+            "<b>Expense saved</b>",
+            f"Date: {html.escape(today)}",
+            f"Description: {html.escape(desc)}",
+            f"Total: {_format_currency(amount)}",
+            f"Payer: {html.escape(payer)}",
+            f"Split with: {', '.join(html.escape(name) for name in selected)}",
+        ]
+
+        if owed_total > 0:
+            confirmation_lines.append(
+                f"{html.escape(payer)} receives {_format_currency(owed_total)} back."
+            )
+
+        if payer_balance is not None:
+            confirmation_lines.append(
+                f"Balance for {html.escape(payer)}: {_format_signed_currency(payer_balance)}"
+            )
+
+        await query.edit_message_text("\n".join(confirmation_lines), parse_mode="HTML")
+        await query.message.reply_text(
+            "Entry stored.", reply_markup=get_main_keyboard()
+        )
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -738,7 +900,15 @@ async def start_chore(update: Update, context: CallbackContext) -> int:
 
 
 async def chore_user(update: Update, context: CallbackContext) -> int:
-    context.user_data["user"] = update.message.text.strip()
+    choice = update.message.text.strip()
+    if choice.lower() in {"done", "cancel", "back to main menu"}:
+        await update.message.reply_text(
+            "Chore entry cancelled.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    context.user_data["user"] = choice
     await update.message.reply_text(
         "How many minutes did it take?", reply_markup=ReplyKeyboardRemove()
     )
@@ -765,31 +935,107 @@ async def chore_minutes(update: Update, context: CallbackContext) -> int:
 
 
 # Show latest logged expenses
+def _format_expense_entry(entry, viewer_name):
+    date = str(entry.get("date", "?"))
+    description = html.escape(str(entry.get("description", "(no description)")))
+    amount = float(entry.get("amount", 0.0) or 0.0)
+    payer = str(entry.get("payer", "?"))
+    split_raw = [str(name) for name in (entry.get("split_with", []) or [])]
+    split_names = [html.escape(name) for name in split_raw]
+
+    viewer_norm = _normalise_member_name(viewer_name)
+    payer_norm = _normalise_member_name(payer)
+    viewer_in_split = any(
+        _normalise_member_name(name) == viewer_norm for name in split_raw
+    )
+
+    lines = [
+        f"<b>{html.escape(date)}</b> · {description}",
+        f"Total: {_format_currency(amount)}",
+        f"Payer: {html.escape(payer)}",
+    ]
+
+    if split_names:
+        lines.append(
+            f"Split ({len(split_names)}): {', '.join(split_names)}"
+        )
+    else:
+        lines.append("Split: —")
+
+    if viewer_norm:
+        if payer_norm == viewer_norm:
+            share_count = len(split_raw)
+            if share_count:
+                share = amount / share_count
+                owed = share * sum(
+                    1 for name in split_raw if _normalise_member_name(name) != payer_norm
+                )
+                if owed > 0:
+                    lines.append(f"To receive: {_format_currency(owed)}")
+        elif viewer_in_split:
+            share_count = len(split_raw)
+            if share_count:
+                share = amount / share_count
+                lines.append(f"Your share: {_format_currency(share)}")
+
+    items = entry.get("items") or []
+    if items:
+        item_lines = []
+        for item in items:
+            name = html.escape(str(item.get("name", "Item")))
+            item_amount = float(item.get("amount", 0.0) or 0.0)
+            item_lines.append(f"{name} ({_format_currency(item_amount)})")
+        lines.append("Items: " + ", ".join(item_lines))
+
+    return "\n".join(lines)
+
+
 async def list_expenses(update: Update, context: CallbackContext) -> None:
     data = load_data()
-    if not data.get("expenses"):
+    expenses = data.get("expenses", []) or []
+    if not expenses:
         await update.message.reply_text(
             "No expenses recorded yet.", reply_markup=get_main_keyboard()
         )
         return
-    items = data["expenses"][-EXPENSE_LIST_LIMIT:][::-1]
-    lines = []
-    for e in items:
-        date = e.get("date", "?")
-        desc = e.get("description", "(no description)")
-        amt = e.get("amount", 0.0)
-        payer = e.get("payer", "?")
-        split = ", ".join(e.get("split_with", [])) or "-"
-        base = f"{date} — {desc} — {amt:.2f}€ | Payer: {payer} | Split: {split}"
-        if e.get("items"):
-            item_summary = ", ".join(
-                f"{item.get('name', 'Item')} ({float(item.get('amount', 0.0)):.2f})"
-                for item in e.get("items", [])
-            )
-            base += f" | Items: {item_summary}"
-        lines.append(base)
-    text = "Recent Expenses:\n" + "\n".join(lines)
-    await update.message.reply_text(text, reply_markup=get_main_keyboard())
+
+    members = data.get("members", []) or []
+    viewer = _resolve_member_for_user(update.effective_user, members)
+
+    if not viewer:
+        await update.message.reply_text(
+            "I cannot match you to a household member. Please ask to be added to the member list.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    viewer_norm = _normalise_member_name(viewer)
+
+    relevant = []
+    for entry in reversed(expenses):
+        payer = entry.get("payer")
+        split_with = entry.get("split_with", []) or []
+        is_payer = _normalise_member_name(payer) == viewer_norm
+        in_split = any(
+            _normalise_member_name(name) == viewer_norm for name in split_with
+        )
+        if is_payer or in_split:
+            relevant.append(entry)
+        if len(relevant) >= EXPENSE_LIST_LIMIT:
+            break
+
+    if not relevant:
+        await update.message.reply_text(
+            "No recent expenses linked to you.", reply_markup=get_main_keyboard()
+        )
+        return
+
+    formatted = [
+        _format_expense_entry(entry, viewer) for entry in relevant
+    ]
+    header = f"<b>Recent expenses involving {html.escape(viewer)}</b>"
+    text = header + "\n\n" + "\n\n".join(formatted)
+    await update.message.reply_html(text, reply_markup=get_main_keyboard())
 
 
 # Calculate + show standings
@@ -833,7 +1079,7 @@ async def standings(update: Update, context: CallbackContext) -> None:
     for m in ordered:
         points = chores.get(m, 0)
         bal = balances.get(m, 0.0)
-        lines.append(f"{m}: {points} points, {bal:+.2f}€")
+        lines.append(f"{m}: {points} points, {_format_signed_currency(bal)}")
 
     await update.message.reply_text("\n".join(lines), reply_markup=get_main_keyboard())
 
@@ -841,27 +1087,252 @@ async def standings(update: Update, context: CallbackContext) -> None:
 # Beer owed
 async def beer_owed(update: Update, context: CallbackContext) -> None:
     data = load_data()
-    leaderboard = sorted(data["chores"].items(), key=lambda x: -x[1])
+    members = data.get("members", []) or []
+    chores = data.get("chores", {}) or {}
+
+    name_map = {
+        _normalise_member_name(member): member for member in members
+    }
+
+    leaderboard = []
+    for raw_name, points in chores.items():
+        matched = name_map.get(_normalise_member_name(raw_name))
+        if matched:
+            leaderboard.append((matched, points))
+
     if not leaderboard:
         await update.message.reply_text("No chores recorded yet.")
         return
 
-    leader_points = leaderboard[0][1]
+    leaderboard.sort(key=lambda item: -item[1])
+    leader_name, leader_points = leaderboard[0]
+    penalties = data.get("penalties", {}) or {}
+
     violators = []
+    for member, points in leaderboard[1:]:
+        gap = leader_points - points
+        if gap > 4:
+            owed = penalties.get(member, 0)
+            if owed:
+                violators.append(
+                    f"{member} owes {owed} beers ({gap} points behind {leader_name})."
+                )
+            else:
+                violators.append(
+                    f"{member} is {gap} points behind {leader_name}."
+                )
 
-    for user, points in leaderboard[1:]:
-        if leader_points - points > 4:
-            weeks_lagging = data["penalties"].get(user, 0) + 1
-            data["penalties"][user] = weeks_lagging
-            violators.append(f"{user} owes {weeks_lagging} beers!")
-
-    save_data(data)
     if violators:
         await update.message.reply_text(
             "Beer Penalties:\n" + "\n".join(violators)
         )
     else:
         await update.message.reply_text("No penalties this week!")
+
+
+async def start_edit_entries(update: Update, context: CallbackContext) -> int:
+    data = load_data()
+    members = data.get("members", []) or []
+
+    if not members:
+        await update.message.reply_text(
+            "No members recorded yet.", reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
+
+    detected = _resolve_member_for_user(update.effective_user, members)
+    if detected:
+        return await _initiate_edit_for_member(
+            update.message, context, detected, data
+        )
+
+    buttons = [[KeyboardButton(name)] for name in members]
+    buttons.append([KeyboardButton("Cancel")])
+    context.user_data["edit_member_selection"] = members
+
+    await update.message.reply_text(
+        "Whose expense would you like to adjust?",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True),
+    )
+    return EDIT_PICK_MEMBER
+
+
+async def edit_entries_pick_member(update: Update, context: CallbackContext) -> int:
+    choice = update.message.text.strip()
+    if choice.lower() in {"cancel", "back to main menu"}:
+        context.user_data.pop("edit_member_selection", None)
+        await update.message.reply_text(
+            "Edit cancelled.", reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
+
+    members = context.user_data.get("edit_member_selection")
+    if not members:
+        members = load_data().get("members", []) or []
+
+    match = _match_member_name(members, choice)
+    if not match:
+        await update.message.reply_text(
+            "Please choose a member from the list."
+        )
+        return EDIT_PICK_MEMBER
+
+    context.user_data.pop("edit_member_selection", None)
+    return await _initiate_edit_for_member(update.message, context, match)
+
+
+async def edit_entries_menu(update: Update, context: CallbackContext) -> int:
+    choice = update.message.text.strip().lower()
+
+    if choice in {"cancel", "back to main menu"}:
+        context.user_data.pop("edit_member", None)
+        context.user_data.pop("edit_index", None)
+        await update.message.reply_text(
+            "Edit cancelled.", reply_markup=get_main_keyboard()
+        )
+        return ConversationHandler.END
+
+    if choice == "amount":
+        await update.message.reply_text(
+            "Enter the corrected total (use a number).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EDIT_AMOUNT
+
+    if choice.startswith("slitt"):
+        data = load_data()
+        members = data.get("members", []) or []
+        member_list = ", ".join(members)
+        await update.message.reply_text(
+            "Send the updated split as comma-separated names."
+            + (f"\nMembers: {member_list}" if member_list else ""),
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EDIT_SPLIT
+
+    await update.message.reply_text("Please choose one of the options above.")
+    return EDIT_MENU
+
+
+async def edit_entries_amount(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    if text.lower() in {"cancel", "back to main menu"}:
+        await update.message.reply_text(
+            "Edit cancelled.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.pop("edit_member", None)
+        context.user_data.pop("edit_index", None)
+        return ConversationHandler.END
+
+    try:
+        amount = float(text.replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(
+            "Please provide a number (e.g. 12.50)."
+        )
+        return EDIT_AMOUNT
+
+    if amount <= 0:
+        await update.message.reply_text("Amount must be greater than zero.")
+        return EDIT_AMOUNT
+
+    idx = context.user_data.get("edit_index")
+    member = context.user_data.get("edit_member")
+    if idx is None or member is None:
+        await update.message.reply_text(
+            "No expense selected.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    data = load_data()
+    expenses = data.get("expenses", []) or []
+    if not (0 <= idx < len(expenses)):
+        await update.message.reply_text(
+            "Could not locate the expense entry.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    expenses[idx]["amount"] = round(amount, 2)
+    save_data(data)
+
+    updated_entry = expenses[idx]
+    context.user_data.clear()
+    await update.message.reply_html(
+        "Amount updated.\n\n" + _format_expense_entry(updated_entry, member),
+        reply_markup=get_main_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def edit_entries_split(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    if text.lower() in {"cancel", "back to main menu"}:
+        await update.message.reply_text(
+            "Edit cancelled.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.pop("edit_member", None)
+        context.user_data.pop("edit_index", None)
+        return ConversationHandler.END
+
+    raw_names = [name.strip() for name in text.split(",") if name.strip()]
+    if not raw_names:
+        await update.message.reply_text(
+            "Please provide at least one member name."
+        )
+        return EDIT_SPLIT
+
+    data = load_data()
+    members = data.get("members", []) or []
+    resolved = []
+    unknown = []
+
+    for name in raw_names:
+        match = _match_member_name(members, name)
+        if not match:
+            unknown.append(name)
+            continue
+        if match not in resolved:
+            resolved.append(match)
+
+    if unknown:
+        await update.message.reply_text(
+            "Unknown member(s): " + ", ".join(unknown)
+        )
+        return EDIT_SPLIT
+
+    if not resolved:
+        await update.message.reply_text("Split cannot be empty.")
+        return EDIT_SPLIT
+
+    idx = context.user_data.get("edit_index")
+    member = context.user_data.get("edit_member")
+    if idx is None or member is None:
+        await update.message.reply_text(
+            "No expense selected.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    expenses = data.get("expenses", []) or []
+    if not (0 <= idx < len(expenses)):
+        await update.message.reply_text(
+            "Could not locate the expense entry.", reply_markup=get_main_keyboard()
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    expenses[idx]["split_with"] = resolved
+    save_data(data)
+
+    updated_entry = expenses[idx]
+    context.user_data.clear()
+    await update.message.reply_html(
+        "Split updated.\n\n" + _format_expense_entry(updated_entry, member),
+        reply_markup=get_main_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 # Weekly report handling
@@ -930,18 +1401,18 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
             if last_week_violator:
                 weeks_lagging = data["penalties"].get(member, 0) + 1
                 data["penalties"][member] = weeks_lagging
-                violators.append(f"{member} owes {weeks_lagging} beers! 🍺")
+                violators.append(f"{member} owes {weeks_lagging} beers!")
             else:
                 if "last_week_violators" not in data:
                     data["last_week_violators"] = {}
                 data["last_week_violators"][member.lower()] = True
                 violators.append(
-                    f"{member} is lagging by {leader_points - points} points behind {leader}. If not improved by next week, beer penalty will apply! ⚠️"
+                    f"{member} is lagging by {leader_points - points} points behind {leader}. If not improved by next week, beer penalty will apply!"
                 )
         elif member.lower() in data.get("last_week_violators", {}):
             data["last_week_violators"].pop(member.lower(), None)
             violators.append(
-                f"{member} has improved their standing! No beer penalty this week. 👍"
+                f"{member} has improved their standing! No beer penalty this week."
             )
 
     save_data(data)
@@ -954,7 +1425,7 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
     else:
         report = f"Weekly Chore Report ({current_date}):\n\n"
         report += f"Leader: {leader} with {leader_points} points\n\n"
-        report += "Everyone is keeping up with their chores! No penalties this week. 🎉"
+        report += "Everyone is keeping up with their chores! No penalties this week."
 
     try:
         await context.bot.send_message(chat_id=group_id, text=report)
@@ -1112,6 +1583,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^List Expenses$"), list_expenses))
     app.add_handler(MessageHandler(filters.Regex("^Check Beer Owed$"), beer_owed))
     app.add_handler(MessageHandler(filters.Regex("^Set Weekly Report$"), set_weekly_report))
+    app.add_handler(MessageHandler(filters.Regex("^Settings$"), open_settings))
+    app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
     app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     expense_conv = ConversationHandler(
@@ -1180,6 +1653,33 @@ def main():
     )
     app.add_handler(manage_conv)
 
+    edit_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Edit Entries$"), start_edit_entries)],
+        states={
+            EDIT_PICK_MEMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_pick_member)
+            ],
+            EDIT_MENU: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_menu)
+            ],
+            EDIT_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_amount)
+            ],
+            EDIT_SPLIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_split)
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, on_timeout)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Cancel$"), cancel),
+        ],
+        conversation_timeout=300,
+    )
+    app.add_handler(edit_conv)
+
     chore_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Chore$"), start_chore)],
         states={
@@ -1205,7 +1705,7 @@ def main():
     setup_chronicler_backup_job(app)
     app.job_queue.run_repeating(
         send_alive,
-        interval=timedelta(hours=4).total_seconds(),
+        interval=timedelta(hours=50).total_seconds(),
         first=0,
         name="heartbeat",
     )
