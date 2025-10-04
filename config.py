@@ -3,3 +3,11 @@ TOKEN = 'your-bot-token'
 GROUP_CHAT_ID = 'your_tg_chat_token'
 BOT_HANDLER_ID = 'your_own_chatid'
 CHRONICLER_ID = 'your_chronicler_chatid'
+
+# Testing Clone creds
+test = True
+CLONE_API_KEY   = ''
+
+if test == True:
+    TOKEN = CLONE_API_KEY
+
