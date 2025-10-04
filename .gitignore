@@ -1,6 +1,8 @@
 # Ignore bot token and user data
 wg_data_beta.json
+porter*
 *.pyc
 __pycache__/
 .env
 config.py
+.venv/
