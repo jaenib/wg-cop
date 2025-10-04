@@ -227,8 +227,8 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Add Expense"), KeyboardButton("Add Chore")],
-            [KeyboardButton("List Expenses"), KeyboardButton("Standings")],
-            [KeyboardButton("Check Beer Owed"), KeyboardButton("Settings")],
+            [KeyboardButton("List Expenses"), KeyboardButton("Check Beer Owed")],
+            [KeyboardButton("Standings"), KeyboardButton("Settings")],
         ],
         resize_keyboard=True,
     )
@@ -540,7 +540,7 @@ async def start_expense(update: Update, context: CallbackContext) -> int:
     keyboard = ReplyKeyboardMarkup(
         [
             [KeyboardButton("Manual Entry")],
-            [KeyboardButton("Scan Receipt")],
+            [KeyboardButton("Scan Receipt (Coming Soon)")],
             [KeyboardButton("Cancel")],
         ],
         resize_keyboard=True,
@@ -565,13 +565,16 @@ async def expense_mode_selection(update: Update, context: CallbackContext) -> in
         )
         return EXPENSE_DESCRIPTION
 
-    if lowered == "scan receipt":
-        context.user_data["mode"] = "receipt"
+    if lowered.startswith("scan receipt"):
+        context.user_data["mode"] = "manual"
         await update.message.reply_text(
-            "Please send a photo or image of the receipt. I'll try to read the line items.",
+            "Receipt scanning is coming soon. I'll walk you through the manual flow instead.",
+        )
+        await update.message.reply_text(
+            "Enter a short description for the expense (e.g., 'Groceries Migros'):",
             reply_markup=ReplyKeyboardRemove(),
         )
-        return EXPENSE_RECEIPT
+        return EXPENSE_DESCRIPTION
 
     if lowered == "cancel":
         return await cancel(update, context)
