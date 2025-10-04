@@ -6,7 +6,7 @@ CHRONICLER_ID = 'your_chronicler_chatid'
 
 # Testing Clone creds
 test = True
-CLONE_API_KEY   = '8009696895:AAE3OEaSsfAqAYNV1N8ZqYP5Wc5KSbCsD_4'
+CLONE_API_KEY   = ''
 
 if test == True:
     TOKEN = CLONE_API_KEY
