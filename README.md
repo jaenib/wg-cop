@@ -2,6 +2,11 @@
 
 A telegram bot to track rommate social credit score and, if prompted, exercise microauthority.
 
+## configuration
+
+- Copy `config.example.py` to `config.py` and replace the placeholder values with your real bot token and Telegram IDs. The repository keeps `config.py` out of version control, so your secrets stay local.
+- Keep your personal `config.py` private. When you need to share settings, edit and commit `config.example.py` with anonymised values instead.
+
 ## how to use
 
 - <p><b> Start</b> with obtaining a bot-token by messaging botfather on telegram and paste it to config.py. Run the maBot.py script somewhere persistently. Find the bot account on telegram and add it as a member to your household group chat.<br><br>You can interact from inside the group chat or dm the bot.<br><br>

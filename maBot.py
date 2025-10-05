@@ -34,10 +34,53 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot Token
-from config import TOKEN
-from config import GROUP_CHAT_ID
-from config import BOT_HANDLER_ID
-from config import CHRONICLER_ID
+try:
+    from config import BOT_HANDLER_ID
+    from config import CHRONICLER_ID
+    from config import GROUP_CHAT_ID
+    from config import TOKEN
+except ImportError as exc:  # pragma: no cover - configuration must be provided by the deployer
+    raise ImportError(
+        "config.py is missing. Copy config.example.py to config.py and fill in your secrets."
+    ) from exc
+
+
+_PLACEHOLDER_VALUES = {
+    "your-bot-token",
+    "your-group-chat-id",
+    "your-handler-id",
+    "your-chronicler-id",
+}
+
+
+def _assert_config_values():
+    missing = []
+    required_keys = (
+        ("TOKEN", TOKEN),
+        ("GROUP_CHAT_ID", GROUP_CHAT_ID),
+        ("BOT_HANDLER_ID", BOT_HANDLER_ID),
+    )
+    optional_keys = (("CHRONICLER_ID", CHRONICLER_ID),)
+
+    for name, value in required_keys:
+        if value in _PLACEHOLDER_VALUES:
+            missing.append(name)
+
+    for name, value in optional_keys:
+        if value in _PLACEHOLDER_VALUES:
+            logger.warning(
+                "Optional configuration %s still uses a placeholder. Leave it blank if unused.",
+                name,
+            )
+
+    if missing:
+        raise RuntimeError(
+            "Replace placeholder values in config.py before starting the bot: "
+            + ", ".join(sorted(missing))
+        )
+
+
+_assert_config_values()
 
 # Data storage
 DATA_FILE = "wg_data_beta.json"
