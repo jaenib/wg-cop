@@ -1,11 +1,16 @@
 import json
 import logging
-import os
+from random import random   
+from random import randint
+import sys, os
 import re
 import tempfile
 import html
 import pytz
+import shutil, time
+from pathlib import Path
 from datetime import datetime, timedelta
+import importlib.util
 
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
@@ -33,57 +38,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot Token
-try:
-    from config import BOT_HANDLER_ID
-    from config import CHRONICLER_ID
-    from config import GROUP_CHAT_ID
-    from config import TOKEN
-except ImportError as exc:  # pragma: no cover - configuration must be provided by the deployer
-    raise ImportError(
-        "config.py is missing. Copy config.example.py to config.py and fill in your secrets."
-    ) from exc
+# Secrets loader
 
+ROOT = Path(__file__).resolve().parent
+CFG_PATH = ROOT / ".secrets" / "config.py"
 
-_PLACEHOLDER_VALUES = {
-    "your-bot-token",
-    "your-group-chat-id",
-    "your-handler-id",
-    "your-chronicler-id",
-}
+if not CFG_PATH.exists():
+    raise FileNotFoundError(f"Missing secrets file: {CFG_PATH}")
 
+_spec = importlib.util.spec_from_file_location("wgcop_config", CFG_PATH)
+_config = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_config)
 
-def _assert_config_values():
-    missing = []
-    required_keys = (
-        ("TOKEN", TOKEN),
-        ("GROUP_CHAT_ID", GROUP_CHAT_ID),
-        ("BOT_HANDLER_ID", BOT_HANDLER_ID),
-    )
-    optional_keys = (("CHRONICLER_ID", CHRONICLER_ID),)
-
-    for name, value in required_keys:
-        if value in _PLACEHOLDER_VALUES:
-            missing.append(name)
-
-    for name, value in optional_keys:
-        if value in _PLACEHOLDER_VALUES:
-            logger.warning(
-                "Optional configuration %s still uses a placeholder. Leave it blank if unused.",
-                name,
-            )
-
-    if missing:
-        raise RuntimeError(
-            "Replace placeholder values in config.py before starting the bot: "
-            + ", ".join(sorted(missing))
-        )
-
-
-_assert_config_values()
+# Bot token & UUID
+TOKEN = getattr(_config, "TOKEN")
+GROUP_CHAT_ID = getattr(_config, "GROUP_CHAT_ID")
+BOT_HANDLER_ID = getattr(_config, "BOT_HANDLER_ID")
+CHRONICLER_ID = getattr(_config, "CHRONICLER_ID")
+NI_ID = getattr(_config, "NI_ID")
+GI_ID = getattr(_config, "GI_ID")
+GY_ID = getattr(_config, "GY_ID")
+TO_ID = getattr(_config, "TO_ID")
+JA_ID = getattr(_config, "JA_ID")
+UIDS = [NI_ID, GI_ID, GY_ID, TO_ID, JA_ID]
 
 # Data storage
-DATA_FILE = "wg_data_beta.json"
+DATA_FILE = "wg_data_alpha.json"
 
 
 def _get_chronicler_chat_id():
@@ -105,6 +86,7 @@ def load_data():
         default_data = {
             "expenses": [],
             "chores": {},
+            "chore_log": [],
             "penalties": {},
             "members": [],
             "chronicler_backup": {"greeting_sent": False, "last_sent": None},
@@ -118,18 +100,51 @@ def load_data():
             "greeting_sent": False,
             "last_sent": None,
         }
-        save_data(data)
-
+    if "chore_log" not in data:
+        data["chore_log"] = []    
+    
+    save_data(data)
     return data
 
 
 def save_data(data):
-    with open(DATA_FILE, "w") as file:
+    """Save bot data safely, keeping timestamped backups."""
+    if os.path.exists(DATA_FILE):
+        # Make timestamped backup before overwriting
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_file = f"{DATA_FILE}.{timestamp}.bak"
+        try:
+            shutil.copy2(DATA_FILE, backup_file)
+            print(f"[wg-cop] Backup created: {backup_file}")
+        except Exception as e:
+            print(f"[wg-cop] Warning: failed to backup data file: {e}")
+
+    # Now overwrite safely
+    tmp_file = DATA_FILE + ".tmp"
+    with open(tmp_file, "w") as file:
         json.dump(data, file, indent=4)
+    os.replace(tmp_file, DATA_FILE)
 
 
 def _normalise_member_name(name: str) -> str:
     return name.strip().casefold() if name else ""
+
+
+def _match_member_UID(candidate):
+    candidate_norm = str(_normalise_member_name(candidate))
+    print(f"Matching candidate: {candidate_norm} and {JA_ID}")
+
+    if candidate_norm == str(NI_ID):
+        return "Nicci Lopez"
+    if candidate_norm == str(GI_ID):
+        return "Gjango Gmüseshole"
+    if candidate_norm == str(GY_ID):
+        return "General Guysan"
+    if candidate_norm == str(TO_ID):
+        return "Thomath Sucker"
+    if candidate_norm == str(JA_ID):
+        return "Janidputz\u00e4"
+    return None
 
 
 def _match_member_name(members, candidate):
@@ -176,22 +191,16 @@ def _format_signed_currency(amount: float) -> str:
     return f"CHF {sign}{amount:.2f}"
 
 
-def _resolve_member_for_user(user, members):
+def _resolve_member_for_user(user):
     if not user:
         return None
 
     candidates = []
-    if user.full_name:
-        candidates.append(user.full_name)
-    if user.first_name:
-        candidates.append(user.first_name)
-    if user.last_name:
-        candidates.append(user.last_name)
-    if user.username:
-        candidates.append(user.username)
+    if user.id:
+        candidates.append(str(user.id))
 
     for candidate in candidates:
-        match = _match_member_name(members, candidate)
+        match = _match_member_UID(candidate)
         if match:
             return match
     return None
@@ -258,7 +267,7 @@ EXPENSE_LIST_LIMIT = 20
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_RECEIPT_MANUAL,
 ) = range(8)
-CHORE_USER, CHORE_MINUTES = range(2)
+CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
 MANAGE_MEMBER = range(1)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 
@@ -270,8 +279,9 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Add Expense"), KeyboardButton("Add Chore")],
-            [KeyboardButton("List Expenses"), KeyboardButton("Check Beer Owed")],
-            [KeyboardButton("Standings"), KeyboardButton("Settings")],
+            [KeyboardButton("List Expenses"), KeyboardButton("List Chores")],
+            [KeyboardButton("Standings"), KeyboardButton("Check Beer Owed")],
+            [KeyboardButton("Settings")],
         ],
         resize_keyboard=True,
     )
@@ -302,7 +312,7 @@ def get_edit_choice_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Amount")],
-            [KeyboardButton("Slitters")],
+            [KeyboardButton("Splitters")],
             [KeyboardButton("Cancel")],
         ],
         resize_keyboard=True,
@@ -505,6 +515,7 @@ def extract_items_from_receipt(image_path: str):
     return items
 
 
+# Start
 async def start(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(
         "WG Bot is active! Use the buttons below:", reply_markup=get_main_keyboard()
@@ -557,8 +568,6 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
 
 
 # Expense flow
-
-
 async def _prompt_for_payer(message, context: CallbackContext) -> int:
     data = load_data()
     if not data.get("members"):
@@ -610,14 +619,18 @@ async def expense_mode_selection(update: Update, context: CallbackContext) -> in
 
     if lowered.startswith("scan receipt"):
         context.user_data["mode"] = "manual"
+        comic = randint(1, 3163)
+        link = f"https://xkcd.com/{comic}/"
         await update.message.reply_text(
-            "Receipt scanning is coming soon. I'll walk you through the manual flow instead.",
+            f"Receipt scanning is coming soon. Here's an xkcd to enjoy meanwhile: {link}",
         )
+        '''
         await update.message.reply_text(
             "Enter a short description for the expense (e.g., 'Groceries Migros'):",
             reply_markup=ReplyKeyboardRemove(),
         )
-        return EXPENSE_DESCRIPTION
+        '''
+        return EXPENSE_MODE
 
     if lowered == "cancel":
         return await cancel(update, context)
@@ -882,7 +895,7 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
         )
 
         members = db.get("members", []) or []
-        payer_key = _match_member_name(members, payer)
+        payer_key = _resolve_member_for_user(update.effective_user)
         balances = calculate_balances(db)
         payer_balance = balances.get(payer_key)
 
@@ -961,26 +974,146 @@ async def chore_user(update: Update, context: CallbackContext) -> int:
     return CHORE_MINUTES
 
 
+def add_chore_entry(data, member: str, points: int, description: str | None = None):
+    entry = {
+        "timestamp": datetime.now(pytz.timezone("Europe/Berlin")).isoformat(),
+        "member": member,
+        "points": points,
+        "description": description or "",
+    }
+
+    data.setdefault("chore_log", []).append(entry)
+
+    # keep your existing totals working
+    data.setdefault("chores", {})
+    data["chores"].setdefault(member, 0)
+    data["chores"][member] += points
+
+    save_data(data)
+
+
 async def chore_minutes(update: Update, context: CallbackContext) -> int:
-    data = load_data()
     try:
         minutes = int(update.message.text)
-        points = minutes // 15
-        user = context.user_data["user"]
-        data["chores"][user] = data["chores"].get(user, 0) + points
-        save_data(data)
-        await update.message.reply_text(
-            f"{user} earned {points} points!", reply_markup=get_main_keyboard()
-        )
-        return ConversationHandler.END
     except ValueError:
         await update.message.reply_text(
             "Invalid input. Enter the minutes again."
         )
         return CHORE_MINUTES
 
+    points = minutes // 15
+    user = context.user_data["user"]
 
-# Show latest logged expenses
+    # Remember values for the next step
+    context.user_data["minutes"] = minutes
+    context.user_data["points"] = points
+
+    # Ask for an optional description
+    await update.message.reply_text(
+        (
+            f"{user} earned {points} points.\n"
+            "Optional: send a short description of the chore "
+            "(what was done). Send '-' to skip."
+        ),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return CHORE_DESCRIPTION
+
+
+async def chore_description(update: Update, context: CallbackContext) -> int:
+    data = load_data()
+
+    user = context.user_data.get("user")
+    points = context.user_data.get("points")
+
+    if user is None or points is None:
+        # Something went wrong in the flow, bail out cleanly
+        await update.message.reply_text(
+            "Something went wrong with the chore entry. Please try again.",
+            reply_markup=get_main_keyboard(),
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    raw_desc = update.message.text.strip()
+    # Allow skipping via '-' or 'skip'
+    if raw_desc in {"-", "skip", "Skip"}:
+        description = ""
+    else:
+        description = raw_desc
+
+    # Single source of truth: logs + totals
+    add_chore_entry(data, user, points, description)
+
+    text = f"{user} earned {points} points!"
+    if description:
+        text += f"\n📝 {description}"
+
+    await update.message.reply_text(text, reply_markup=get_main_keyboard())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def handle_chore(update: Update, context: CallbackContext) -> None:
+    # Usage: /chore <points> <optional description...>
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /chore <points> [description...]\n"
+            "Example: /chore 2 cleaned bathroom"
+        )
+        return
+
+    points_str, *desc_parts = context.args
+    try:
+        points = int(points_str)
+    except ValueError:
+        await update.message.reply_text("First argument has to be the number of points.")
+        return
+
+    description = " ".join(desc_parts) if desc_parts else ""
+
+    user = update.effective_user
+    data = load_data()
+
+    member_name = _match_member_name(
+        data["members"],
+        user.id,
+    ) or user.full_name
+
+    add_chore_entry(data, member_name, points, description)
+
+    text = f"Recorded {points} points for {member_name}."
+    if description:
+        text += f"\n📝 {description}"
+
+    await update.message.reply_text(text)
+
+
+def _format_chore_entry(entry):
+    ts = entry.get("timestamp", "")[:16].replace("T", " ")
+    member = entry.get("member", "?")
+    points = entry.get("points", 0)
+    desc = entry.get("description", "")
+    desc_part = f" – {desc}" if desc else ""
+    return f"<b>{ts}</b> · {member} (+{points} pts){desc_part}"
+
+
+async def list_chores(update: Update, context: CallbackContext) -> None:
+    data = load_data()
+    entries = data.get("chore_log", []) or []
+    if not entries:
+        await update.message.reply_text(
+            "No chores recorded yet.", reply_markup=get_main_keyboard()
+        )
+        return
+
+    # Show last 10
+    entries = entries[-10:]
+    formatted = "\n\n".join(_format_chore_entry(e) for e in entries)
+    await update.message.reply_html(formatted, reply_markup=get_main_keyboard())
+
+
+# Display new standings after entry
 def _format_expense_entry(entry, viewer_name):
     date = str(entry.get("date", "?"))
     description = html.escape(str(entry.get("description", "(no description)")))
@@ -1036,6 +1169,7 @@ def _format_expense_entry(entry, viewer_name):
     return "\n".join(lines)
 
 
+# Show latest logged expenses
 async def list_expenses(update: Update, context: CallbackContext) -> None:
     data = load_data()
     expenses = data.get("expenses", []) or []
@@ -1046,7 +1180,8 @@ async def list_expenses(update: Update, context: CallbackContext) -> None:
         return
 
     members = data.get("members", []) or []
-    viewer = _resolve_member_for_user(update.effective_user, members)
+    viewer = _resolve_member_for_user(update.effective_user)
+    context.user_data["viewer_member"] = viewer
 
     if not viewer:
         await update.message.reply_text(
@@ -1077,10 +1212,11 @@ async def list_expenses(update: Update, context: CallbackContext) -> None:
         return
 
     formatted = [
-        _format_expense_entry(entry, viewer) for entry in relevant
+        _format_expense_entry(entry, viewer) for entry in reversed(relevant)
     ]
     header = f"<b>Recent expenses involving {html.escape(viewer)}</b>"
     text = header + "\n\n" + "\n\n".join(formatted)
+    text = text + "\n\n" + header
     await update.message.reply_html(text, reply_markup=get_main_keyboard())
 
 
@@ -1186,7 +1322,7 @@ async def start_edit_entries(update: Update, context: CallbackContext) -> int:
         )
         return ConversationHandler.END
 
-    detected = _resolve_member_for_user(update.effective_user, members)
+    detected = _resolve_member_for_user(update.effective_user)
     if detected:
         return await _initiate_edit_for_member(
             update.message, context, detected, data
@@ -1529,6 +1665,8 @@ async def send_chronicler_backup(context: CallbackContext) -> None:
 
     data = load_data()
     backup_meta = _get_chronicler_meta(data)
+    comic = randint(1, 3163)
+    link = f"https://xkcd.com/{comic}/"
 
     try:
         with open(DATA_FILE, "rb") as doc:
@@ -1536,10 +1674,14 @@ async def send_chronicler_backup(context: CallbackContext) -> None:
                 chat_id=chronicler_chat_id,
                 document=doc,
                 filename=DATA_FILE,
-                caption="Weekly archive backup",
+                caption=f"Weekly archive backup and an xkcd for your troubles",
             )
     except (FileNotFoundError, TelegramError) as e:
         logger.error(f"Failed to send chronicler backup: {e}")
+    try:
+        await context.bot.send_message(chat_id=chronicler_chat_id, text=f"{link}")
+    except TelegramError as e:
+        logger.error(f"Failed to send xkcd link to chronicler: {e}")
         return
 
     backup_meta["last_sent"] = datetime.now(pytz.timezone("Europe/Berlin")).isoformat()
@@ -1591,8 +1733,10 @@ def setup_weekly_job(application):
 
 async def send_alive(context: CallbackContext) -> None:
     """Send a periodic heartbeat message to confirm the bot is running."""
+    comic = randint(1, 3163)
+    link = f"https://xkcd.com/{comic}/"
     try:
-        await context.bot.send_message(chat_id=BOT_HANDLER_ID, text="I'm alive")
+        await context.bot.send_message(chat_id=BOT_HANDLER_ID, text=f"I'm alive, thanks for caring, here's an xkcd for you {link}")
     except TelegramError as e:
         logger.error(f"Failed to send heartbeat: {e}")
 
@@ -1624,9 +1768,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("expenses", list_expenses))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("chore", handle_chore))
+    app.add_handler(CommandHandler("chores", list_chores))
 
     app.add_handler(MessageHandler(filters.Regex("^Standings$"), standings))
     app.add_handler(MessageHandler(filters.Regex("^List Expenses$"), list_expenses))
+    app.add_handler(MessageHandler(filters.Regex("^List Chores$"), list_chores))
     app.add_handler(MessageHandler(filters.Regex("^Check Beer Owed$"), beer_owed))
     app.add_handler(MessageHandler(filters.Regex("^Set Weekly Report$"), set_weekly_report))
     app.add_handler(MessageHandler(filters.Regex("^Settings$"), open_settings))
@@ -1735,6 +1882,9 @@ def main():
             CHORE_MINUTES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, chore_minutes)
             ],
+            CHORE_DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, chore_description)
+            ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
             ],
@@ -1745,6 +1895,7 @@ def main():
         ],
         conversation_timeout=300,
     )
+
     app.add_handler(chore_conv)
 
     setup_weekly_job(app)
