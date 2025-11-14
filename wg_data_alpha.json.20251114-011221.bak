@@ -1,0 +1,11 @@
+{
+    "expenses": [],
+    "chores": {},
+    "chore_log": [],
+    "penalties": {},
+    "members": [],
+    "chronicler_backup": {
+        "greeting_sent": false,
+        "last_sent": null
+    }
+}
