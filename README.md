@@ -16,6 +16,8 @@ A telegram bot to track rommate social credit score and, if prompted, exercise m
 
 ## advanced handling
 
+- **Vacation Status**: Members can set their status to "vacating" using `/setstatus <name> vacating` when on vacation. When selecting expense splitters, vacating members appear at the bottom with "(vacating)" label as a reminder to only include them for long-term expenses. Switch back with `/setstatus <name> active`.
+
 - The bot sends an "I'm alive" message every day to confirm it is running to the "bothandler user id", if one is specified in config.py.<br><br>
 - The bot sends a copy of the database (json) to the "chronicler user id" if one specified in config.py<br><br>
 

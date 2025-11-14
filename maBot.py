@@ -101,7 +101,23 @@ def load_data():
             "last_sent": None,
         }
     if "chore_log" not in data:
-        data["chore_log"] = []    
+        data["chore_log"] = []
+    
+    # Migrate members from strings to objects with status field
+    if data.get("members"):
+        needs_migration = False
+        for member in data["members"]:
+            if isinstance(member, str):
+                needs_migration = True
+                break
+        
+        if needs_migration:
+            data["members"] = [
+                _member_to_dict(m) if isinstance(m, str) else m
+                for m in data["members"]
+            ]
+            save_data(data)
+            logger.info("Migrated members to new object format with status field")
     
     save_data(data)
     return data
@@ -127,7 +143,29 @@ def save_data(data):
 
 
 def _normalise_member_name(name: str) -> str:
+    """Normalize a member name (string or object) to lowercase."""
+    if isinstance(name, dict):
+        name = name.get("name", "")
     return name.strip().casefold() if name else ""
+
+
+def _get_member_name(member):
+    """Get the display name from a member (string or object)."""
+    if isinstance(member, dict):
+        return member.get("name", "")
+    return member
+
+
+def _get_member_status(member):
+    """Get the status from a member object, default to 'active'."""
+    if isinstance(member, dict):
+        return member.get("status", "active")
+    return "active"
+
+
+def _member_to_dict(member_name: str):
+    """Convert a member name to a member object."""
+    return {"name": member_name, "status": "active"}
 
 
 def _match_member_UID(candidate):
@@ -135,19 +173,20 @@ def _match_member_UID(candidate):
     print(f"Matching candidate: {candidate_norm} and {JA_ID}")
 
     if candidate_norm == str(NI_ID):
-        return "Nicci Lopez"
+        return _member_to_dict("Nicci Lopez")
     if candidate_norm == str(GI_ID):
-        return "Gjango Gmüseshole"
+        return _member_to_dict("Gjango Gmüseshole")
     if candidate_norm == str(GY_ID):
-        return "General Guysan"
+        return _member_to_dict("General Guysan")
     if candidate_norm == str(TO_ID):
-        return "Thomath Sucker"
+        return _member_to_dict("Thomath Sucker")
     if candidate_norm == str(JA_ID):
-        return "Janidputz\u00e4"
+        return _member_to_dict("Janidputzä")
     return None
 
 
 def _match_member_name(members, candidate):
+    """Match a candidate name against a list of members (strings or objects)."""
     candidate_norm = _normalise_member_name(candidate)
     for member in members:
         if _normalise_member_name(member) == candidate_norm:
@@ -157,11 +196,15 @@ def _match_member_name(members, candidate):
 
 def calculate_balances(data):
     members = data.get("members", []) or []
-    balances = {member: 0.0 for member in members}
+    # Create balance dict using member names (strings)
+    member_names = [_get_member_name(m) for m in members]
+    balances = {name: 0.0 for name in member_names}
 
     for expense in data.get("expenses", []) or []:
         amount = float(expense.get("amount", 0.0) or 0.0)
         payer = _match_member_name(members, expense.get("payer"))
+        payer_name = _get_member_name(payer) if payer else None
+        
         split_with = []
         for participant in expense.get("split_with", []) or []:
             matched = _match_member_name(members, participant)
@@ -173,11 +216,12 @@ def calculate_balances(data):
 
         share = amount / len(split_with)
 
-        if payer:
-            balances[payer] = balances.get(payer, 0.0) + amount
+        if payer_name:
+            balances[payer_name] = balances.get(payer_name, 0.0) + amount
 
         for participant in split_with:
-            balances[participant] = balances.get(participant, 0.0) - share
+            participant_name = _get_member_name(participant)
+            balances[participant_name] = balances.get(participant_name, 0.0) - share
 
     return balances
 
@@ -217,21 +261,25 @@ def _find_last_expense_for_payer(expenses, payer_name):
 
 async def _initiate_edit_for_member(message, context, member_name, data=None):
     data = data or load_data()
+    
+    # member_name could be a dict object, extract the name if needed
+    display_name = _get_member_name(member_name)
+    
     expenses = data.get("expenses", []) or []
-    idx, entry = _find_last_expense_for_payer(expenses, member_name)
+    idx, entry = _find_last_expense_for_payer(expenses, display_name)
 
     if entry is None:
         await message.reply_text(
-            f"No expenses found for {member_name}.", reply_markup=get_main_keyboard()
+            f"No expenses found for {display_name}.", reply_markup=get_main_keyboard()
         )
         return ConversationHandler.END
 
-    context.user_data["edit_member"] = member_name
+    context.user_data["edit_member"] = display_name
     context.user_data["edit_index"] = idx
 
-    summary = _format_expense_entry(entry, member_name)
+    summary = _format_expense_entry(entry, display_name)
     prompt = (
-        f"Last expense for {html.escape(member_name)}:\n\n"
+        f"Last expense for {html.escape(display_name)}:\n\n"
         f"{summary}\n\nWhat do you want to edit?"
     )
 
@@ -291,7 +339,7 @@ def get_member_keyboard(data):
     members = data.get("members", [])
     if not members:
         return None
-    buttons = [[KeyboardButton(member)] for member in members]
+    buttons = [[KeyboardButton(_get_member_name(member))] for member in members]
     buttons.append([KeyboardButton("Done")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
@@ -302,6 +350,7 @@ def get_settings_keyboard():
             [KeyboardButton("Manage Members")],
             [KeyboardButton("Edit Entries")],
             [KeyboardButton("Set Weekly Report")],
+            [KeyboardButton("Set Vacation Status")],
             [KeyboardButton("Back to Main Menu")],
         ],
         resize_keyboard=True,
@@ -338,19 +387,46 @@ def _truncate_button_label(label: str, limit: int = 60) -> str:
 
 
 def build_payer_inline_kb(members):
-    rows = [[InlineKeyboardButton(m, callback_data=f"{CB_PAYER_PREFIX}{m}")] for m in members]
+    rows = []
+    for m in members:
+        name = _get_member_name(m)
+        rows.append([InlineKeyboardButton(name, callback_data=f"{CB_PAYER_PREFIX}{name}")])
     return InlineKeyboardMarkup(rows)
 
 
 def build_split_inline_kb(members, selected):
-    rows = []
+    # Sort members: active first, then vacating (italic, at the end)
+    active_members = []
+    vacating_members = []
+    
     for m in members:
-        picked = m in selected
+        name = _get_member_name(m)
+        status = _get_member_status(m)
+        if status == "vacating":
+            vacating_members.append((name, m))
+        else:
+            active_members.append((name, m))
+    
+    rows = []
+    
+    # Add active members first
+    for name, m in active_members:
+        picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
         prefix = "[x] " if picked else "[ ] "
-        label = f"{prefix}{m}"
+        label = f"{prefix}{name}"
         rows.append(
-            [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{m}")]
+            [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
         )
+    
+    # Add vacating members in italic (reminder not to forget them for long-term only)
+    for name, m in vacating_members:
+        picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
+        prefix = "[x] " if picked else "[ ] "
+        label = f"{prefix}<i>{name} (vacating)</i>"
+        rows.append(
+            [InlineKeyboardButton(f"{prefix}{name} (vacating)", callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
+        )
+    
     rows.append(
         [
             InlineKeyboardButton("Back", callback_data=CB_SPLIT_BACK),
@@ -526,7 +602,7 @@ async def start(update: Update, context: CallbackContext) -> None:
 async def manage_members(update: Update, context: CallbackContext) -> int:
     data = load_data()
     if data["members"]:
-        members_list = ", ".join(data["members"])
+        members_list = ", ".join(_get_member_name(m) for m in data["members"])
         txt = (
             f"Current members: {members_list}\n\n"
             "Send a name to add/remove.\n"
@@ -553,13 +629,14 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
 
     name_ci = text.lower()
     existing_index = next(
-        (i for i, m in enumerate(data["members"]) if m.lower() == name_ci), None
+        (i for i, m in enumerate(data["members"]) if _normalise_member_name(m) == name_ci), None
     )
     if existing_index is not None:
-        removed = data["members"].pop(existing_index)
-        response = f"Removed {removed} from the household."
+        removed_member = data["members"].pop(existing_index)
+        removed_name = _get_member_name(removed_member)
+        response = f"Removed {removed_name} from the household."
     else:
-        data["members"].append(text)
+        data["members"].append(_member_to_dict(text))
         response = f"Added {text} to the household."
 
     save_data(data)
@@ -895,9 +972,8 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
         )
 
         members = db.get("members", []) or []
-        payer_key = _resolve_member_for_user(update.effective_user)
         balances = calculate_balances(db)
-        payer_balance = balances.get(payer_key)
+        payer_balance = balances.get(payer)
 
         confirmation_lines = [
             "<b>Expense saved</b>",
@@ -1075,10 +1151,12 @@ async def handle_chore(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
     data = load_data()
 
-    member_name = _match_member_name(
+    member_obj = _match_member_name(
         data["members"],
-        user.id,
-    ) or user.full_name
+        str(user.id),
+    ) or _match_member_name(data["members"], user.full_name)
+    
+    member_name = _get_member_name(member_obj) if member_obj else user.full_name
 
     add_chore_entry(data, member_name, points, description)
 
@@ -1190,7 +1268,8 @@ async def list_expenses(update: Update, context: CallbackContext) -> None:
         )
         return
 
-    viewer_norm = _normalise_member_name(viewer)
+    viewer_name = _get_member_name(viewer)
+    viewer_norm = _normalise_member_name(viewer_name)
 
     relevant = []
     for entry in reversed(expenses):
@@ -1212,9 +1291,9 @@ async def list_expenses(update: Update, context: CallbackContext) -> None:
         return
 
     formatted = [
-        _format_expense_entry(entry, viewer) for entry in reversed(relevant)
+        _format_expense_entry(entry, viewer_name) for entry in reversed(relevant)
     ]
-    header = f"<b>Recent expenses involving {html.escape(viewer)}</b>"
+    header = f"<b>Recent expenses involving {html.escape(viewer_name)}</b>"
     text = header + "\n\n" + "\n\n".join(formatted)
     text = text + "\n\n" + header
     await update.message.reply_html(text, reply_markup=get_main_keyboard())
@@ -1230,7 +1309,9 @@ async def standings(update: Update, context: CallbackContext) -> None:
         )
         return
 
-    balances = {m: 0.0 for m in members}
+    # Create member name dict for lookups
+    member_names = [_get_member_name(m) for m in members]
+    balances = {name: 0.0 for name in member_names}
 
     for expense in data.get("expenses", []):
         payer = expense.get("payer", "")
@@ -1240,22 +1321,24 @@ async def standings(update: Update, context: CallbackContext) -> None:
             continue
         share = amount / len(split_with)
 
-        payer_key = next((m for m in members if m.lower() == payer.lower()), None)
-        if payer_key:
-            balances[payer_key] = balances.get(payer_key, 0.0) + amount
+        payer_matched = _match_member_name(members, payer)
+        payer_name = _get_member_name(payer_matched) if payer_matched else None
+        if payer_name:
+            balances[payer_name] = balances.get(payer_name, 0.0) + amount
 
         for u in split_with:
-            u_key = next((m for m in members if m.lower() == u.lower()), None)
-            if u_key:
-                balances[u_key] = balances.get(u_key, 0.0) - share
+            u_matched = _match_member_name(members, u)
+            u_name = _get_member_name(u_matched) if u_matched else None
+            if u_name:
+                balances[u_name] = balances.get(u_name, 0.0) - share
 
     chores = {}
     for name, pts in (data.get("chores", {}) or {}).items():
-        mkey = next((m for m in members if m.lower() == name.lower()), None)
+        mkey = _match_member_name(members, name)
         if mkey:
-            chores[mkey] = pts
+            chores[_get_member_name(mkey)] = pts
 
-    ordered = sorted(members, key=lambda m: (chores.get(m, 0)), reverse=True)
+    ordered = sorted(member_names, key=lambda m: (chores.get(m, 0)), reverse=True)
 
     lines = []
     for m in ordered:
@@ -1272,9 +1355,11 @@ async def beer_owed(update: Update, context: CallbackContext) -> None:
     members = data.get("members", []) or []
     chores = data.get("chores", {}) or {}
 
-    name_map = {
-        _normalise_member_name(member): member for member in members
-    }
+    # Build name map from members (supporting both string and object formats)
+    name_map = {}
+    for member in members:
+        member_name = _get_member_name(member)
+        name_map[_normalise_member_name(member_name)] = member_name
 
     leaderboard = []
     for raw_name, points in chores.items():
@@ -1328,7 +1413,8 @@ async def start_edit_entries(update: Update, context: CallbackContext) -> int:
             update.message, context, detected, data
         )
 
-    buttons = [[KeyboardButton(name)] for name in members]
+    member_names = [_get_member_name(m) for m in members]
+    buttons = [[KeyboardButton(name)] for name in member_names]
     buttons.append([KeyboardButton("Cancel")])
     context.user_data["edit_member_selection"] = members
 
@@ -1505,7 +1591,9 @@ async def edit_entries_split(update: Update, context: CallbackContext) -> int:
         context.user_data.clear()
         return ConversationHandler.END
 
-    expenses[idx]["split_with"] = resolved
+    # Convert resolved member objects to names for storage
+    resolved_names = [_get_member_name(m) for m in resolved]
+    expenses[idx]["split_with"] = resolved_names
     save_data(data)
 
     updated_entry = expenses[idx]
@@ -1560,12 +1648,14 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
     chores_normalized = {}
     for chore_user, points in data["chores"].items():
         for member in data["members"]:
-            if member.lower() == chore_user.lower():
-                chores_normalized[member] = points
+            member_name = _get_member_name(member)
+            if _normalise_member_name(member_name) == _normalise_member_name(chore_user):
+                chores_normalized[member_name] = points
                 break
 
+    member_names = [_get_member_name(m) for m in data["members"]]
     leaderboard = sorted(
-        [(member, chores_normalized.get(member, 0)) for member in data["members"]],
+        [(name, chores_normalized.get(name, 0)) for name in member_names],
         key=lambda x: -x[1],
     )
 
@@ -1578,7 +1668,7 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
     for member, points in leaderboard[1:]:
         if leader_points - points > 4:
             last_week_violator = data.get("last_week_violators", {}).get(
-                member.lower(), False
+                _normalise_member_name(member), False
             )
             if last_week_violator:
                 weeks_lagging = data["penalties"].get(member, 0) + 1
@@ -1587,12 +1677,12 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
             else:
                 if "last_week_violators" not in data:
                     data["last_week_violators"] = {}
-                data["last_week_violators"][member.lower()] = True
+                data["last_week_violators"][_normalise_member_name(member)] = True
                 violators.append(
                     f"{member} is lagging by {leader_points - points} points behind {leader}. If not improved by next week, beer penalty will apply!"
                 )
-        elif member.lower() in data.get("last_week_violators", {}):
-            data["last_week_violators"].pop(member.lower(), None)
+        elif _normalise_member_name(member) in data.get("last_week_violators", {}):
+            data["last_week_violators"].pop(_normalise_member_name(member), None)
             violators.append(
                 f"{member} has improved their standing! No beer penalty this week."
             )
@@ -1749,6 +1839,70 @@ async def cancel(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
+async def set_vacation_status(update: Update, context: CallbackContext) -> None:
+    """Toggle vacation status. Usage: /setstatus or /setstatus <name>"""
+    data = load_data()
+    members = data.get("members", []) or []
+    
+    # Check if a name was provided as argument
+    if context.args:
+        # Admin mode: set status for specified member
+        member_name_arg = " ".join(context.args)
+        member_match = _match_member_name(members, member_name_arg)
+        if not member_match:
+            await update.message.reply_text(
+                f"Member '{member_name_arg}' not found."
+            )
+            return
+    else:
+        # Auto-identify caller by Chat ID
+        member_uid = _resolve_member_for_user(update.effective_user)
+        if not member_uid:
+            await update.message.reply_text(
+                "I cannot match you to a household member. Please ask to be added to the member list."
+            )
+            return
+        
+        # Get the member name from the resolved UID
+        member_name_arg = _get_member_name(member_uid)
+        member_match = _match_member_name(members, member_name_arg)
+        if not member_match:
+            await update.message.reply_text(
+                "I cannot match you to a household member. Please ask to be added to the member list."
+            )
+            return
+    
+    member_name = _get_member_name(member_match)
+    current_status = _get_member_status(member_match)
+    new_status = "vacating" if current_status == "active" else "active"
+    
+    # Update the member in the list
+    for member in members:
+        if _normalise_member_name(member) == _normalise_member_name(member_match):
+            if isinstance(member, dict):
+                member["status"] = new_status
+            else:
+                # Convert old string format to dict
+                idx = members.index(member)
+                members[idx] = {"name": member, "status": new_status}
+            break
+    
+    save_data(data)
+    
+    if new_status == "vacating":
+        await update.message.reply_text(
+            f"✅ {member_name}, you are now on vacation. "
+            f"You will appear at the bottom when selecting splitters, "
+            f"to remind others to only include you for long-term expenses.",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ {member_name}, you are now active.",
+            reply_markup=get_main_keyboard()
+        )
+
+
 async def on_timeout(update: Update, context: CallbackContext) -> int:
     context.user_data.clear()
     chat = update.effective_chat
@@ -1770,12 +1924,14 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("chore", handle_chore))
     app.add_handler(CommandHandler("chores", list_chores))
+    app.add_handler(CommandHandler("setstatus", set_vacation_status))
 
     app.add_handler(MessageHandler(filters.Regex("^Standings$"), standings))
     app.add_handler(MessageHandler(filters.Regex("^List Expenses$"), list_expenses))
     app.add_handler(MessageHandler(filters.Regex("^List Chores$"), list_chores))
     app.add_handler(MessageHandler(filters.Regex("^Check Beer Owed$"), beer_owed))
     app.add_handler(MessageHandler(filters.Regex("^Set Weekly Report$"), set_weekly_report))
+    app.add_handler(MessageHandler(filters.Regex("^Set Vacation Status$"), set_vacation_status))
     app.add_handler(MessageHandler(filters.Regex("^Settings$"), open_settings))
     app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
     app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
