@@ -1891,14 +1891,14 @@ async def set_vacation_status(update: Update, context: CallbackContext) -> None:
     
     if new_status == "vacating":
         await update.message.reply_text(
-            f"✅ {member_name}, you are now on vacation. "
+            f"{member_name}, you are now on vacation. "
             f"You will appear at the bottom when selecting splitters, "
             f"to remind others to only include you for long-term expenses.",
             reply_markup=get_main_keyboard()
         )
     else:
         await update.message.reply_text(
-            f"✅ {member_name}, you are now active.",
+            f"{member_name}, you are now active.",
             reply_markup=get_main_keyboard()
         )
 
