@@ -2310,14 +2310,21 @@ def main():
     )
     app.add_handler(edit_conv)
 
+    _nav_pattern = filters.Regex(
+        "^(Penalties|Check Beer Owed|Back to Main Menu|Settings|"
+        "Add Expense|Add Chore|Standings|List Expenses|List Chores|"
+        "Manage Members)$"
+    )
     redeem_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Redeem Beer$"), redeem_start)],
         states={
             REDEEM_MEMBER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_member)
+                MessageHandler(_nav_pattern, cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_member),
             ],
             REDEEM_COUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_count)
+                MessageHandler(_nav_pattern, cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_count),
             ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
@@ -2327,6 +2334,7 @@ def main():
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex("^Cancel$"), cancel),
         ],
+        allow_reentry=True,
         conversation_timeout=300,
     )
     app.add_handler(redeem_conv)
