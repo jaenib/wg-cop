@@ -1915,15 +1915,21 @@ def _build_weekly_report(data):
     # --- Big moves this week: members with >1h total across all sessions ---
     week_entries = _chore_entries_this_week(data.get("chore_log") or [])
     member_week_pts = {}
+    member_week_entries = {}
     for e in week_entries:
         member = e.get("member", "?")
         member_week_pts[member] = member_week_pts.get(member, 0) + e.get("points", 0)
+        member_week_entries.setdefault(member, []).append(e)
     big_movers = {m: pts for m, pts in member_week_pts.items() if pts > 4}
     if big_movers:
         leap_lines = []
         for member, pts in sorted(big_movers.items(), key=lambda x: -x[1]):
             mins = pts * 15
             leap_lines.append(f"  • {member}: {mins} min total")
+            for e in member_week_entries[member]:
+                desc = e.get("description", "").strip()
+                if desc:
+                    leap_lines.append(f"    – {desc}")
         sections.append("Big moves this week:\n" + "\n".join(leap_lines))
 
     # --- Expense fun facts ---
