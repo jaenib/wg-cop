@@ -324,6 +324,7 @@ MANAGE_MEMBER = range(1)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
 ADMIN_BEER_MEMBER, ADMIN_BEER_COUNT = range(2)
+ADMIN_HOECK_DATE = 0  # single-state conv
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 
@@ -368,6 +369,7 @@ def get_admin_keyboard():
         [
             [KeyboardButton("Trigger Weekly Report")],
             [KeyboardButton("Adjust Beer Count")],
+            [KeyboardButton("Set WG-Höck")],
             [KeyboardButton("Back to Settings")],
         ],
         resize_keyboard=True,
@@ -1934,6 +1936,22 @@ def _build_weekly_report(data):
                     leap_lines.append(f"    – {desc}")
         sections.append("Big moves this week:\n" + "\n".join(leap_lines))
 
+    # --- WG-Höck reminder ---
+    hoeck_date_str = data.get("wg_hoeck_date")
+    if hoeck_date_str:
+        try:
+            hoeck_date = datetime.strptime(hoeck_date_str, "%Y-%m-%d").date()
+            today = datetime.now(pytz.timezone("Europe/Berlin")).date()
+            days_until = (hoeck_date - today).days
+            if 0 <= days_until <= 7:
+                day_name = hoeck_date.strftime("%A, %d.%m.")
+                if days_until == 0:
+                    sections.append(f"📅 WG-Höck is TODAY!")
+                else:
+                    sections.append(f"📅 WG-Höck this week: {day_name} ({days_until} day{'s' if days_until != 1 else ''} away)")
+        except ValueError:
+            pass
+
     # --- Expense fun facts ---
     fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
     if fun_facts:
@@ -2070,6 +2088,79 @@ async def admin_beer_count(update: Update, context: CallbackContext) -> int:
         reply_markup=get_admin_keyboard(),
     )
     return ConversationHandler.END
+
+
+async def admin_hoeck_start(update: Update, context: CallbackContext) -> int:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    data = load_data()
+    current = data.get("wg_hoeck_date", "not set")
+    await update.message.reply_text(
+        f"Current WG-Höck date: {current}\n\n"
+        "Enter the new date (DD.MM.YYYY or YYYY-MM-DD):",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
+    )
+    return ADMIN_HOECK_DATE
+
+
+async def admin_hoeck_date(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    parsed = None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y", "%d/%m/%Y"):
+        try:
+            parsed = datetime.strptime(text, fmt).date()
+            break
+        except ValueError:
+            continue
+
+    if not parsed:
+        await update.message.reply_text(
+            "Could not parse date. Please use DD.MM.YYYY or YYYY-MM-DD."
+        )
+        return 0
+
+    data = load_data()
+    data["wg_hoeck_date"] = parsed.isoformat()
+    save_data(data)
+
+    day_name = parsed.strftime("%A, %d.%m.%Y")
+    await update.message.reply_text(
+        f"WG-Höck set to {day_name}.",
+        reply_markup=get_admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def send_hoeck_reminder(context: CallbackContext) -> None:
+    """Fires daily at noon CET. Sends reminder if today is WG-Höck day."""
+    data = load_data()
+    hoeck_date_str = data.get("wg_hoeck_date")
+    if not hoeck_date_str:
+        return
+
+    tz = pytz.timezone("Europe/Berlin")
+    today = datetime.now(tz).date()
+    try:
+        hoeck_date = datetime.strptime(hoeck_date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return
+
+    if today != hoeck_date:
+        return
+
+    group_id = data.get("group_chat_id")
+    if not group_id:
+        group_id = GROUP_CHAT_ID
+
+    try:
+        await context.bot.send_message(
+            chat_id=group_id,
+            text="📅 Reminder: WG-Höck is today! Be there.",
+        )
+    except TelegramError as e:
+        logger.error(f"Failed to send Höck reminder: {e}")
 
 
 def _get_chronicler_meta(data):
@@ -2329,6 +2420,23 @@ def main():
     )
     app.add_handler(admin_beer_conv)
 
+    admin_hoeck_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^Set WG-Höck$"), admin_hoeck_start)],
+        states={
+            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_hoeck_date)],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, on_timeout)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Cancel$"), cancel),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
+    )
+    app.add_handler(admin_hoeck_conv)
+
     expense_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Expense$"), start_expense)],
         states={
@@ -2478,6 +2586,22 @@ def main():
 
     setup_weekly_job(app)
     setup_chronicler_backup_job(app)
+
+    # Daily noon check for WG-Höck reminder
+    tz = pytz.timezone("Europe/Berlin")
+    now = datetime.now(tz)
+    noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    if now >= noon_today:
+        noon_today += timedelta(days=1)
+    seconds_until_noon = (noon_today - now).total_seconds()
+    app.job_queue.run_repeating(
+        send_hoeck_reminder,
+        interval=timedelta(days=1).total_seconds(),
+        first=seconds_until_noon,
+        name="hoeck_reminder",
+    )
+    logger.info(f"Höck reminder scheduled, next check at {noon_today.strftime('%Y-%m-%d %H:%M')}")
+
     app.job_queue.run_repeating(
         send_alive,
         interval=timedelta(hours=50).total_seconds(),
