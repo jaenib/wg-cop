@@ -3,6 +3,7 @@ name: Deploy
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -21,5 +22,5 @@ jobs:
             git fetch origin main
             git checkout main
             git pull --ff-only origin main
-            ./venv/bin/pip install -q -r requirements.txt
+            ./venv/bin/python -m pip install -q -r requirements.txt
             systemctl restart wg_cop
