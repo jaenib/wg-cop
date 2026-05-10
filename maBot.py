@@ -1912,17 +1912,19 @@ def _build_weekly_report(data):
         names = ", ".join(comeback_kids)
         sections.append(f"Comeback of the week: {names} turned it around after lagging last week!")
 
-    # --- Big chore leaps this week (>1h = >4 pts in one session) ---
+    # --- Big moves this week: members with >1h total across all sessions ---
     week_entries = _chore_entries_this_week(data.get("chore_log") or [])
-    leaps = [e for e in week_entries if e.get("points", 0) > 4]
-    if leaps:
+    member_week_pts = {}
+    for e in week_entries:
+        member = e.get("member", "?")
+        member_week_pts[member] = member_week_pts.get(member, 0) + e.get("points", 0)
+    big_movers = {m: pts for m, pts in member_week_pts.items() if pts > 4}
+    if big_movers:
         leap_lines = []
-        for e in sorted(leaps, key=lambda x: -x.get("points", 0)):
-            mins = e["points"] * 15
-            desc = e.get("description", "")
-            desc_part = f' ("{desc}")' if desc else ""
-            leap_lines.append(f"  • {e['member']}: {mins} min{desc_part}")
-        sections.append("Big moves this week (>1h sessions):\n" + "\n".join(leap_lines))
+        for member, pts in sorted(big_movers.items(), key=lambda x: -x[1]):
+            mins = pts * 15
+            leap_lines.append(f"  • {member}: {mins} min total")
+        sections.append("Big moves this week:\n" + "\n".join(leap_lines))
 
     # --- Expense fun facts ---
     fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
