@@ -318,6 +318,7 @@ EXPENSE_LIST_LIMIT = 20
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
 MANAGE_MEMBER = range(1)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
+REDEEM_MEMBER, REDEEM_COUNT = range(2)
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 
@@ -328,7 +329,7 @@ def get_main_keyboard():
         [
             [KeyboardButton("Add Expense"), KeyboardButton("Add Chore")],
             [KeyboardButton("List Expenses"), KeyboardButton("List Chores")],
-            [KeyboardButton("Standings"), KeyboardButton("Check Beer Owed")],
+            [KeyboardButton("Standings"), KeyboardButton("Penalties")],
             [KeyboardButton("Settings")],
         ],
         resize_keyboard=True,
@@ -357,6 +358,17 @@ def get_settings_keyboard():
     )
 
 
+def get_penalties_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Check Beer Owed")],
+            [KeyboardButton("Redeem Beer")],
+            [KeyboardButton("Back to Main Menu")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def get_edit_choice_keyboard():
     return ReplyKeyboardMarkup(
         [
@@ -365,6 +377,12 @@ def get_edit_choice_keyboard():
             [KeyboardButton("Cancel")],
         ],
         resize_keyboard=True,
+    )
+
+
+async def open_penalties(update: Update, context: CallbackContext) -> None:
+    await update.message.reply_text(
+        "Penalties menu:", reply_markup=get_penalties_keyboard()
     )
 
 
@@ -1391,10 +1409,103 @@ async def beer_owed(update: Update, context: CallbackContext) -> None:
 
     if violators:
         await update.message.reply_text(
-            "Beer Penalties:\n" + "\n".join(violators)
+            "Beer Penalties:\n" + "\n".join(violators),
+            reply_markup=get_penalties_keyboard(),
         )
     else:
-        await update.message.reply_text("No penalties this week!")
+        await update.message.reply_text(
+            "No penalties this week!", reply_markup=get_penalties_keyboard()
+        )
+
+
+async def redeem_start(update: Update, context: CallbackContext) -> int:
+    data = load_data()
+    penalties = data.get("penalties", {}) or {}
+    members_with_penalties = {k: v for k, v in penalties.items() if v > 0}
+
+    if not members_with_penalties:
+        await update.message.reply_text(
+            "Nobody owes any beers right now.", reply_markup=get_penalties_keyboard()
+        )
+        return ConversationHandler.END
+
+    buttons = [[KeyboardButton(name)] for name in sorted(members_with_penalties)]
+    buttons.append([KeyboardButton("Cancel")])
+    await update.message.reply_text(
+        "Who brought the beer? Select a member:",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True),
+    )
+    return REDEEM_MEMBER
+
+
+async def redeem_member(update: Update, context: CallbackContext) -> int:
+    data = load_data()
+    penalties = data.get("penalties", {}) or {}
+    members = data.get("members", []) or []
+    chosen = update.message.text.strip()
+
+    matched = _match_member_name(members, chosen)
+    if not matched:
+        await update.message.reply_text(
+            "Member not found. Please pick a name from the keyboard."
+        )
+        return REDEEM_MEMBER
+
+    member_name = _get_member_name(matched)
+    owed = penalties.get(member_name, 0)
+    if owed <= 0:
+        await update.message.reply_text(
+            f"{member_name} has no beers to redeem.", reply_markup=get_penalties_keyboard()
+        )
+        return ConversationHandler.END
+
+    context.user_data["redeem_member"] = member_name
+    context.user_data["redeem_max"] = owed
+    await update.message.reply_text(
+        f"{member_name} currently owes {owed} beer(s).\n"
+        f"How many beers are being redeemed? (1–{owed})",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
+    )
+    return REDEEM_COUNT
+
+
+async def redeem_count(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    member_name = context.user_data.get("redeem_member")
+    max_count = context.user_data.get("redeem_max", 0)
+
+    try:
+        count = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"Please enter a whole number between 1 and {max_count}."
+        )
+        return REDEEM_COUNT
+
+    if count < 1 or count > max_count:
+        await update.message.reply_text(
+            f"Please enter a number between 1 and {max_count}."
+        )
+        return REDEEM_COUNT
+
+    data = load_data()
+    penalties = data.get("penalties", {}) or {}
+    new_count = penalties.get(member_name, 0) - count
+    if new_count <= 0:
+        penalties.pop(member_name, None)
+    else:
+        penalties[member_name] = new_count
+    data["penalties"] = penalties
+    save_data(data)
+
+    remaining = max(0, max_count - count)
+    msg = (
+        f"Redeemed {count} beer(s) for {member_name}. "
+        + (f"{remaining} still owed." if remaining else "All beers redeemed!")
+    )
+    context.user_data.clear()
+    await update.message.reply_text(msg, reply_markup=get_penalties_keyboard())
+    return ConversationHandler.END
 
 
 async def start_edit_entries(update: Update, context: CallbackContext) -> int:
@@ -1929,6 +2040,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Standings$"), standings))
     app.add_handler(MessageHandler(filters.Regex("^List Expenses$"), list_expenses))
     app.add_handler(MessageHandler(filters.Regex("^List Chores$"), list_chores))
+    app.add_handler(MessageHandler(filters.Regex("^Penalties$"), open_penalties))
     app.add_handler(MessageHandler(filters.Regex("^Check Beer Owed$"), beer_owed))
     app.add_handler(MessageHandler(filters.Regex("^Set Weekly Report$"), set_weekly_report))
     app.add_handler(MessageHandler(filters.Regex("^Set Vacation Status$"), set_vacation_status))
@@ -2028,6 +2140,27 @@ def main():
         conversation_timeout=300,
     )
     app.add_handler(edit_conv)
+
+    redeem_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Redeem Beer$"), redeem_start)],
+        states={
+            REDEEM_MEMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_member)
+            ],
+            REDEEM_COUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_count)
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, on_timeout)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Cancel$"), cancel),
+        ],
+        conversation_timeout=300,
+    )
+    app.add_handler(redeem_conv)
 
     chore_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Chore$"), start_chore)],
