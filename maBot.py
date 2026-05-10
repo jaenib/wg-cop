@@ -1,6 +1,7 @@
 import json
 import logging
-from random import random   
+import copy
+from random import random
 from random import randint
 import sys, os
 import re
@@ -345,14 +346,24 @@ def get_member_keyboard(data):
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-def get_settings_keyboard():
+def get_settings_keyboard(is_admin=False):
+    buttons = [
+        [KeyboardButton("Manage Members")],
+        [KeyboardButton("Edit Entries")],
+        [KeyboardButton("Set Weekly Report")],
+        [KeyboardButton("Set Vacation Status")],
+    ]
+    if is_admin:
+        buttons.append([KeyboardButton("Admin Panel")])
+    buttons.append([KeyboardButton("Back to Main Menu")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+
+def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("Manage Members")],
-            [KeyboardButton("Edit Entries")],
-            [KeyboardButton("Set Weekly Report")],
-            [KeyboardButton("Set Vacation Status")],
-            [KeyboardButton("Back to Main Menu")],
+            [KeyboardButton("Trigger Weekly Report")],
+            [KeyboardButton("Back to Settings")],
         ],
         resize_keyboard=True,
     )
@@ -387,14 +398,31 @@ async def open_penalties(update: Update, context: CallbackContext) -> None:
 
 
 async def open_settings(update: Update, context: CallbackContext) -> None:
+    is_admin = update.effective_user.id == BOT_HANDLER_ID
     await update.message.reply_text(
-        "Settings menu:", reply_markup=get_settings_keyboard()
+        "Settings menu:", reply_markup=get_settings_keyboard(is_admin=is_admin)
     )
 
 
 async def settings_back(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(
         "Main menu ready.", reply_markup=get_main_keyboard()
+    )
+
+
+async def open_admin_menu(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    await update.message.reply_text("Admin panel:", reply_markup=get_admin_keyboard())
+
+
+async def admin_back(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    await update.message.reply_text(
+        "Settings menu:", reply_markup=get_settings_keyboard(is_admin=True)
     )
 
 
@@ -1737,6 +1765,152 @@ async def set_weekly_report(update: Update, context: CallbackContext) -> None:
             )
 
 
+def _chore_entries_this_week(chore_log):
+    tz = pytz.timezone("Europe/Berlin")
+    cutoff = datetime.now(tz) - timedelta(days=7)
+    result = []
+    for entry in chore_log or []:
+        try:
+            ts = datetime.fromisoformat(entry["timestamp"])
+            if ts.tzinfo is None:
+                ts = tz.localize(ts)
+        except (KeyError, ValueError):
+            continue
+        if ts >= cutoff:
+            result.append(entry)
+    return result
+
+
+def _expenses_in_period(expenses, days=28):
+    cutoff = datetime.now() - timedelta(days=days)
+    result = []
+    for e in expenses or []:
+        try:
+            d = datetime.strptime(e["date"], "%Y-%m-%d")
+        except (KeyError, ValueError):
+            continue
+        if d >= cutoff:
+            result.append(e)
+    return result
+
+
+def _build_expense_fun_facts(expenses):
+    recent = _expenses_in_period(expenses, days=28)
+    if not recent:
+        return None
+
+    payer_count = {}
+    payer_total = {}
+    for e in recent:
+        payer = e.get("payer", "?")
+        amount = float(e.get("amount", 0))
+        payer_count[payer] = payer_count.get(payer, 0) + 1
+        payer_total[payer] = payer_total.get(payer, 0) + amount
+
+    total_spend = sum(payer_total.values())
+    total_entries = sum(payer_count.values())
+
+    lines = [f"Expense snapshot (last 28 days): €{total_spend:.2f} across {total_entries} entries"]
+
+    if len(payer_count) >= 2:
+        most_frequent = max(payer_count, key=payer_count.get)
+        lines.append(f"  • {most_frequent} paid most often ({payer_count[most_frequent]}x)")
+
+        avg_per = {p: payer_total[p] / payer_count[p] for p in payer_count}
+        highest = max(avg_per, key=avg_per.get)
+        lowest = min(avg_per, key=avg_per.get)
+        if highest != lowest:
+            lines.append(
+                f"  • Avg per entry: {highest} €{avg_per[highest]:.2f} vs {lowest} €{avg_per[lowest]:.2f}"
+            )
+
+        top_payer = max(payer_total, key=payer_total.get)
+        share_pct = payer_total[top_payer] / total_spend * 100
+        if share_pct >= 40:
+            lines.append(
+                f"  • {top_payer} covered {share_pct:.0f}% of total spending"
+            )
+    elif len(payer_count) == 1:
+        sole = next(iter(payer_count))
+        lines.append(f"  • {sole} paid for everything this month – someone owes them!")
+
+    return "\n".join(lines)
+
+
+def _build_weekly_report(data):
+    """Build the weekly report text, mutating data to apply penalty changes."""
+    chores_normalized = {}
+    for chore_user, points in (data.get("chores") or {}).items():
+        for member in data.get("members") or []:
+            member_name = _get_member_name(member)
+            if _normalise_member_name(member_name) == _normalise_member_name(chore_user):
+                chores_normalized[member_name] = points
+                break
+
+    member_names = [_get_member_name(m) for m in (data.get("members") or [])]
+    leaderboard = sorted(
+        [(name, chores_normalized.get(name, 0)) for name in member_names],
+        key=lambda x: -x[1],
+    )
+
+    if not leaderboard:
+        return "Weekly Chore Report: No data yet."
+
+    leader, leader_points = leaderboard[0]
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    sections = [f"Weekly Chore Report ({current_date})", f"Leader: {leader} with {leader_points} points"]
+
+    # --- Standings & penalties ---
+    penalty_lines = []
+    comeback_kids = []
+    for member, points in leaderboard[1:]:
+        if leader_points - points > 4:
+            last_week_violator = data.get("last_week_violators", {}).get(
+                _normalise_member_name(member), False
+            )
+            if last_week_violator:
+                weeks_lagging = data.setdefault("penalties", {}).get(member, 0) + 1
+                data["penalties"][member] = weeks_lagging
+                penalty_lines.append(f"  • {member} owes {weeks_lagging} beer(s)!")
+            else:
+                data.setdefault("last_week_violators", {})[_normalise_member_name(member)] = True
+                penalty_lines.append(
+                    f"  • {member} is {leader_points - points} pts behind {leader} — shape up or beer incoming!"
+                )
+        elif _normalise_member_name(member) in data.get("last_week_violators", {}):
+            data["last_week_violators"].pop(_normalise_member_name(member), None)
+            comeback_kids.append(member)
+
+    if penalty_lines:
+        sections.append("Standings & Penalties:\n" + "\n".join(penalty_lines))
+    else:
+        sections.append("Everyone is keeping up — no penalties this week!")
+
+    # --- Comeback kids ---
+    if comeback_kids:
+        names = ", ".join(comeback_kids)
+        sections.append(f"Comeback of the week: {names} turned it around after lagging last week!")
+
+    # --- Big chore leaps this week (>1h = >4 pts in one session) ---
+    week_entries = _chore_entries_this_week(data.get("chore_log") or [])
+    leaps = [e for e in week_entries if e.get("points", 0) > 4]
+    if leaps:
+        leap_lines = []
+        for e in sorted(leaps, key=lambda x: -x.get("points", 0)):
+            mins = e["points"] * 15
+            desc = e.get("description", "")
+            desc_part = f' ("{desc}")' if desc else ""
+            leap_lines.append(f"  • {e['member']}: {mins} min{desc_part}")
+        sections.append("Big moves this week (>1h sessions):\n" + "\n".join(leap_lines))
+
+    # --- Expense fun facts ---
+    fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
+    if fun_facts:
+        sections.append(fun_facts)
+
+    return "\n\n".join(sections)
+
+
 async def check_weekly_penalties(context: CallbackContext) -> None:
     data = load_data()
 
@@ -1746,74 +1920,45 @@ async def check_weekly_penalties(context: CallbackContext) -> None:
 
     group_id = data["group_chat_id"]
 
-    if not data["members"] or not data["chores"]:
+    if not data.get("members") or not data.get("chores"):
         try:
             await context.bot.send_message(
                 chat_id=group_id,
-                text="Weekly Report: Not enough data to calculate penalties. Make sure members are added and chores are recorded."
+                text="Weekly Report: Not enough data yet. Add members and log some chores first.",
             )
         except TelegramError as e:
             logger.error(f"Failed to send weekly report: {e}")
         return
 
-    chores_normalized = {}
-    for chore_user, points in data["chores"].items():
-        for member in data["members"]:
-            member_name = _get_member_name(member)
-            if _normalise_member_name(member_name) == _normalise_member_name(chore_user):
-                chores_normalized[member_name] = points
-                break
-
-    member_names = [_get_member_name(m) for m in data["members"]]
-    leaderboard = sorted(
-        [(name, chores_normalized.get(name, 0)) for name in member_names],
-        key=lambda x: -x[1],
-    )
-
-    if not leaderboard:
-        return
-
-    leader, leader_points = leaderboard[0]
-    violators = []
-
-    for member, points in leaderboard[1:]:
-        if leader_points - points > 4:
-            last_week_violator = data.get("last_week_violators", {}).get(
-                _normalise_member_name(member), False
-            )
-            if last_week_violator:
-                weeks_lagging = data["penalties"].get(member, 0) + 1
-                data["penalties"][member] = weeks_lagging
-                violators.append(f"{member} owes {weeks_lagging} beers!")
-            else:
-                if "last_week_violators" not in data:
-                    data["last_week_violators"] = {}
-                data["last_week_violators"][_normalise_member_name(member)] = True
-                violators.append(
-                    f"{member} is lagging by {leader_points - points} points behind {leader}. If not improved by next week, beer penalty will apply!"
-                )
-        elif _normalise_member_name(member) in data.get("last_week_violators", {}):
-            data["last_week_violators"].pop(_normalise_member_name(member), None)
-            violators.append(
-                f"{member} has improved their standing! No beer penalty this week."
-            )
-
+    report = _build_weekly_report(data)
     save_data(data)
-
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    if violators:
-        report = f"Weekly Chore Report ({current_date}):\n\n"
-        report += f"Leader: {leader} with {leader_points} points\n\n"
-        report += "Penalties:\n" + "\n".join(violators)
-    else:
-        report = f"Weekly Chore Report ({current_date}):\n\n"
-        report += f"Leader: {leader} with {leader_points} points\n\n"
-        report += "Everyone is keeping up with their chores! No penalties this week."
 
     try:
         await context.bot.send_message(chat_id=group_id, text=report)
     except TelegramError as e:
         logger.error(f"Failed to send weekly report: {e}")
+
+
+async def admin_trigger_report(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    data = load_data()
+    if not data.get("members") or not data.get("chores"):
+        await update.message.reply_text(
+            "Not enough data yet. Add members and log some chores first.",
+            reply_markup=get_admin_keyboard(),
+        )
+        return
+
+    dry_data = copy.deepcopy(data)
+    report = _build_weekly_report(dry_data)
+
+    await update.message.reply_text(
+        f"[DRY RUN — not sent to group, no data changed]\n\n{report}",
+        reply_markup=get_admin_keyboard(),
+    )
 
 
 def _get_chronicler_meta(data):
@@ -2046,6 +2191,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Set Vacation Status$"), set_vacation_status))
     app.add_handler(MessageHandler(filters.Regex("^Settings$"), open_settings))
     app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
+    app.add_handler(MessageHandler(filters.Regex("^Admin Panel$"), open_admin_menu))
+    app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), admin_back))
+    app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
     app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     expense_conv = ConversationHandler(
