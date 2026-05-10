@@ -323,6 +323,7 @@ CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
 MANAGE_MEMBER = range(1)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
+ADMIN_BEER_MEMBER, ADMIN_BEER_COUNT = range(2)
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 
@@ -366,6 +367,7 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Trigger Weekly Report")],
+            [KeyboardButton("Adjust Beer Count")],
             [KeyboardButton("Back to Settings")],
         ],
         resize_keyboard=True,
@@ -1990,6 +1992,86 @@ async def admin_trigger_report(update: Update, context: CallbackContext) -> None
     )
 
 
+async def admin_beer_start(update: Update, context: CallbackContext) -> int:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    data = load_data()
+    members = data.get("members", []) or []
+    penalties = data.get("penalties", {}) or {}
+
+    buttons = []
+    for member in members:
+        name = _get_member_name(member)
+        owed = penalties.get(name, 0)
+        buttons.append([KeyboardButton(f"{name} ({owed})")])
+    buttons.append([KeyboardButton("Cancel")])
+
+    await update.message.reply_text(
+        "Select member to adjust beer count (current count shown):",
+        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True),
+    )
+    return ADMIN_BEER_MEMBER
+
+
+async def admin_beer_member(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    # Strip the " (N)" suffix from the button label
+    if " (" in text and text.endswith(")"):
+        text = text.rsplit(" (", 1)[0]
+
+    data = load_data()
+    members = data.get("members", []) or []
+    matched = _match_member_name(members, text)
+    if not matched:
+        await update.message.reply_text("Member not found. Please pick from the keyboard.")
+        return ADMIN_BEER_MEMBER
+
+    member_name = _get_member_name(matched)
+    penalties = data.get("penalties", {}) or {}
+    current = penalties.get(member_name, 0)
+    context.user_data["admin_beer_member"] = member_name
+
+    await update.message.reply_text(
+        f"{member_name} currently owes {current} beer(s).\n"
+        f"Enter the new count (0 to clear):",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
+    )
+    return ADMIN_BEER_COUNT
+
+
+async def admin_beer_count(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    member_name = context.user_data.get("admin_beer_member")
+
+    try:
+        count = int(text)
+    except ValueError:
+        await update.message.reply_text("Please enter a whole number (0 or above).")
+        return ADMIN_BEER_COUNT
+
+    if count < 0:
+        await update.message.reply_text("Please enter 0 or a positive number.")
+        return ADMIN_BEER_COUNT
+
+    data = load_data()
+    penalties = data.get("penalties", {}) or {}
+    old = penalties.get(member_name, 0)
+    if count == 0:
+        penalties.pop(member_name, None)
+    else:
+        penalties[member_name] = count
+    data["penalties"] = penalties
+    save_data(data)
+
+    await update.message.reply_text(
+        f"Updated {member_name}: {old} → {count} beer(s).",
+        reply_markup=get_admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 def _get_chronicler_meta(data):
     return data.setdefault(
         "chronicler_backup",
@@ -2224,6 +2306,28 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), admin_back))
     app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
     app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
+
+    admin_beer_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Adjust Beer Count$"), admin_beer_start)],
+        states={
+            ADMIN_BEER_MEMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_member)
+            ],
+            ADMIN_BEER_COUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_count)
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, on_timeout)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Cancel$"), cancel),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
+    )
+    app.add_handler(admin_beer_conv)
 
     expense_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Expense$"), start_expense)],
