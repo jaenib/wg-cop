@@ -1871,11 +1871,11 @@ def _build_weekly_report(data):
     )
 
     if not leaderboard:
-        return "Weekly Chore Report: No data yet."
+        return "Mario's Monday Mauling: No data yet."
 
     leader, leader_points = leaderboard[0]
     current_date = datetime.now().strftime("%Y-%m-%d")
-    sections = [f"Weekly Chore Report ({current_date})", f"Leader: {leader} with {leader_points} points"]
+    sections = [f"Mario's Monday Mauling, {current_date}", f"Leader: {leader} with {leader_points} points"]
 
     # --- Standings & penalties ---
     penalty_lines = []
@@ -1930,11 +1930,19 @@ def _build_weekly_report(data):
         for member, pts in sorted(big_movers.items(), key=lambda x: -x[1]):
             mins = pts * 15
             leap_lines.append(f"  • {member}: {mins} min total")
-            for e in member_week_entries[member]:
-                desc = e.get("description", "").strip()
-                if desc:
-                    leap_lines.append(f"    – {desc}")
+            descs = [
+                e.get("description", "").strip()
+                for e in member_week_entries[member]
+                if e.get("description", "").strip()
+            ]
+            if descs:
+                leap_lines.append(f"  ({', '.join(descs)})")
         sections.append("Big moves this week:\n" + "\n".join(leap_lines))
+
+    # --- Expense fun facts ---
+    fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
+    if fun_facts:
+        sections.append(fun_facts)
 
     # --- WG-Höck reminder ---
     hoeck_date_str = data.get("wg_hoeck_date")
@@ -1951,11 +1959,6 @@ def _build_weekly_report(data):
                     sections.append(f"📅 WG-Höck this week: {day_name} ({days_until} day{'s' if days_until != 1 else ''} away)")
         except ValueError:
             pass
-
-    # --- Expense fun facts ---
-    fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
-    if fun_facts:
-        sections.append(fun_facts)
 
     return "\n\n".join(sections)
 
