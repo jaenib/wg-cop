@@ -55,7 +55,10 @@ _spec.loader.exec_module(_config)
 # Bot token & UUID
 TOKEN = getattr(_config, "TOKEN")
 GROUP_CHAT_ID = getattr(_config, "GROUP_CHAT_ID")
-BOT_HANDLER_ID = int(getattr(_config, "BOT_HANDLER_ID"))
+try:
+    BOT_HANDLER_ID = int(getattr(_config, "BOT_HANDLER_ID"))
+except (TypeError, ValueError):
+    BOT_HANDLER_ID = None  # admin features disabled when unconfigured
 CHRONICLER_ID = getattr(_config, "CHRONICLER_ID")
 NI_ID = getattr(_config, "NI_ID")
 GI_ID = getattr(_config, "GI_ID")
