@@ -55,7 +55,10 @@ _spec.loader.exec_module(_config)
 # Bot token & UUID
 TOKEN = getattr(_config, "TOKEN")
 GROUP_CHAT_ID = getattr(_config, "GROUP_CHAT_ID")
-BOT_HANDLER_ID = getattr(_config, "BOT_HANDLER_ID")
+try:
+    BOT_HANDLER_ID = int(getattr(_config, "BOT_HANDLER_ID"))
+except (TypeError, ValueError):
+    BOT_HANDLER_ID = None  # admin features disabled when unconfigured
 CHRONICLER_ID = getattr(_config, "CHRONICLER_ID")
 NI_ID = getattr(_config, "NI_ID")
 GI_ID = getattr(_config, "GI_ID")
@@ -1825,7 +1828,7 @@ def _build_expense_fun_facts(expenses):
             )
 
         top_payer = max(payer_total, key=payer_total.get)
-        share_pct = payer_total[top_payer] / total_spend * 100
+        share_pct = payer_total[top_payer] / total_spend * 100 if total_spend else 0
         if share_pct >= 40:
             lines.append(
                 f"  • {top_payer} covered {share_pct:.0f}% of total spending"
