@@ -1424,23 +1424,33 @@ async def beer_owed(update: Update, context: CallbackContext) -> None:
     leader_name, leader_points = leaderboard[0]
     penalties = data.get("penalties", {}) or {}
 
-    violators = []
+    # Collect members currently lagging beyond threshold
+    currently_lagging = set()
+    lines = []
     for member, points in leaderboard[1:]:
         gap = leader_points - points
         if gap > 4:
+            currently_lagging.add(member)
             owed = penalties.get(member, 0)
             if owed:
-                violators.append(
-                    f"{member} owes {owed} beers ({gap} points behind {leader_name})."
+                lines.append(
+                    f"{member} owes {owed} beer(s) ({gap} pts behind {leader_name})."
                 )
             else:
-                violators.append(
-                    f"{member} is {gap} points behind {leader_name}."
+                lines.append(
+                    f"{member} is {gap} pts behind {leader_name} (warning)."
                 )
 
-    if violators:
+    # Also list members who still owe beers but have since caught up
+    for member, owed in penalties.items():
+        if owed > 0 and member not in currently_lagging:
+            lines.append(
+                f"{member} still owes {owed} beer(s) (caught up, debt remains)."
+            )
+
+    if lines:
         await update.message.reply_text(
-            "Beer Penalties:\n" + "\n".join(violators),
+            "Beer Penalties:\n" + "\n".join(lines),
             reply_markup=get_penalties_keyboard(),
         )
     else:
@@ -1866,8 +1876,10 @@ def _build_weekly_report(data):
     # --- Standings & penalties ---
     penalty_lines = []
     comeback_kids = []
+    currently_penalised = set()
     for member, points in leaderboard[1:]:
         if leader_points - points > 4:
+            currently_penalised.add(member)
             last_week_violator = data.get("last_week_violators", {}).get(
                 _normalise_member_name(member), False
             )
@@ -1883,6 +1895,12 @@ def _build_weekly_report(data):
         elif _normalise_member_name(member) in data.get("last_week_violators", {}):
             data["last_week_violators"].pop(_normalise_member_name(member), None)
             comeback_kids.append(member)
+
+    # Include members who caught up but still owe unredeemed beers
+    penalties = data.get("penalties", {}) or {}
+    for member, owed in penalties.items():
+        if owed > 0 and member not in currently_penalised:
+            penalty_lines.append(f"  • {member} still owes {owed} beer(s) (caught up, debt remains).")
 
     if penalty_lines:
         sections.append("Standings & Penalties:\n" + "\n".join(penalty_lines))
