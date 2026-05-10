@@ -1939,6 +1939,11 @@ def _build_weekly_report(data):
                 leap_lines.append(f"  ({', '.join(descs)})")
         sections.append("Big moves this week:\n" + "\n".join(leap_lines))
 
+    # --- Expense fun facts ---
+    fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
+    if fun_facts:
+        sections.append(fun_facts)
+
     # --- WG-Höck reminder ---
     hoeck_date_str = data.get("wg_hoeck_date")
     if hoeck_date_str:
@@ -1954,20 +1959,6 @@ def _build_weekly_report(data):
                     sections.append(f"📅 WG-Höck this week: {day_name} ({days_until} day{'s' if days_until != 1 else ''} away)")
         except ValueError:
             pass
-
-    # --- Expense fun facts ---
-    fun_facts = _build_expense_fun_facts(data.get("expenses") or [])
-    if fun_facts:
-        sections.append(fun_facts)
-
-    # --- WG-Höck countdown ---
-    tz = pytz.timezone("Europe/Berlin")
-    now = datetime.now(tz)
-    days_until_wednesday = (2 - now.weekday()) % 7 or 7
-    next_wednesday = now + timedelta(days=days_until_wednesday)
-    sections.append(
-        f"📅 WG-Höck this week: Wednesday, {next_wednesday.strftime('%d.%m.')} ({days_until_wednesday} days away)"
-    )
 
     return "\n\n".join(sections)
 
