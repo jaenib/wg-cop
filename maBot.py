@@ -8,7 +8,6 @@ import sys, os
 import re
 import tempfile
 import html
-import subprocess
 import pytz
 import shutil, time
 from pathlib import Path
@@ -30,10 +29,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     _openai_lib = None
 
-try:
-    from PIL import Image, ImageOps, ImageFilter
-except ImportError:  # pragma: no cover - optional dependency
-    Image = ImageOps = ImageFilter = None
 
 # Set up logging
 logging.basicConfig(
@@ -69,9 +64,7 @@ TO_ID = getattr(_config, "TO_ID")
 JA_ID = getattr(_config, "JA_ID")
 UIDS = [NI_ID, GI_ID, GY_ID, TO_ID, JA_ID]
 OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", None)
-RECEIPT_LOCAL_OCR_ENABLED = str(
-    getattr(_config, "RECEIPT_LOCAL_OCR_ENABLED", "false")
-).strip().lower() in ("1", "true", "yes", "on")
+RECEIPT_TOLERANCE_CHF = 0.50  # max sum-vs-total gap before retry
 
 # Data storage
 DATA_FILE = os.environ.get("WG_COP_DATA_FILE", "wg_data_alpha.json")
@@ -637,9 +630,7 @@ async def admin_system_overview(update: Update, context: CallbackContext) -> Non
         f"  - python: {sys.version.split()[0]}",
         f"  - openai lib import: {bool(_openai_lib)}",
         f"  - OPENAI_API_KEY: {_secret_status(OPENAI_API_KEY)}",
-        f"  - RECEIPT_LOCAL_OCR_ENABLED: {RECEIPT_LOCAL_OCR_ENABLED}",
-        f"  - PIL available: {Image is not None}",
-        f"  - tesseract in PATH: {shutil.which('tesseract') or 'not found'}",
+        f"  - RECEIPT_TOLERANCE_CHF: {RECEIPT_TOLERANCE_CHF}",
         "",
         "Persistent Storage (no raw roommate content shown):",
         f"  - data file: {data_file_path} -> {_file_overview(data_file_path)}",
@@ -779,497 +770,63 @@ def build_receipt_items_kb(items, selected):
     return InlineKeyboardMarkup(rows)
 
 
-_LINE_ITEM_AMOUNT_RE = re.compile(r"(-?\d+[.,]\d{1,2})")
-_OCR_AMOUNT_RE = re.compile(r"(-?\d+[.,]\d{1,3})")
-_COLUMN_TOKEN_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
-_HEADER_MARKERS = re.compile(r"\bartikel\b", re.IGNORECASE)
-_STOP_MARKERS = re.compile(r"\b(total|summe|gesamt)\b", re.IGNORECASE)
-_COLUMN_WORDS = {"aktion", "ak", "chf"}
-_TOTAL_LINE_RE = re.compile(r"\b(total|summe|gesamt)\b.*?(-?\d+[.,]\d{1,2})", re.IGNORECASE)
+RECEIPT_PARSE_LOG = os.path.join(BACKUP_DIR, "receipt_parse_log.jsonl")
+_MANUAL_ITEM_RE = re.compile(r"^(.+?)[\s\-:]+(\d+[.,]\d{1,2})\s*$")
 
 
-def _looks_like_column_token(token: str) -> bool:
-    stripped = token.strip(" :-–—")
-    if not stripped:
-        return True
-    lower = stripped.lower()
-    if _COLUMN_TOKEN_RE.fullmatch(stripped):
-        return True
-    if lower in _COLUMN_WORDS:
-        return True
-    if len(stripped) == 1 and stripped.isalpha() and stripped.isupper():
-        return True
-    return False
-
-
-def _normalise_receipt_line(line: str) -> str:
-    return re.sub(r"\s+", " ", line).strip()
-
-
-def _parse_line_item(line: str):
-    clean = _normalise_receipt_line(line)
-    if not clean:
-        return None
-
-    matches = list(_LINE_ITEM_AMOUNT_RE.finditer(clean))
-    if not matches:
-        return None
-
-    amount_match = matches[-1]
-    amount_raw = amount_match.group(1)
-    try:
-        amount = round(float(amount_raw.replace(",", ".")), 2)
-    except ValueError:
-        return None
-
-    name_part = clean[: amount_match.start()].strip()
-    if not name_part:
-        return None
-
-    tokens = name_part.split()
-    while tokens and _looks_like_column_token(tokens[-1]):
-        tokens.pop()
-
-    name = " ".join(tokens).strip(" :-–—")
-    if len(name) < 2 or sum(ch.isalpha() for ch in name) < 2:
-        return None
-
-    return {"name": name, "amount": amount}
-
-
-def parse_receipt_text(text: str):
-    raw_lines = [ln.rstrip() for ln in text.splitlines()]
+def _parse_manual_receipt_items(text: str):
     items = []
-
-    start_idx = 0
-    for idx, line in enumerate(raw_lines):
-        if _HEADER_MARKERS.search(line):
-            start_idx = idx + 1
-            break
-
-    relevant_lines = []
-    for line in raw_lines[start_idx:]:
-        if _STOP_MARKERS.search(line):
-            break
-        if not line.strip():
+    for line in text.splitlines():
+        m = _MANUAL_ITEM_RE.match(line.strip())
+        if not m:
             continue
-        lower_line = line.lower()
-        if (
-            not any(ch.isdigit() for ch in lower_line)
-            and any(word in lower_line for word in ("menge", "preis", "aktion", "mwst", "vat"))
-        ):
+        name = m.group(1).strip(" -:")
+        if not name:
             continue
-        relevant_lines.append(line)
-
-    buffer = ""
-    for line in relevant_lines:
-        candidate = f"{buffer} {line}".strip() if buffer else line
-        parsed = _parse_line_item(candidate)
-        if parsed:
-            items.append(parsed)
-            buffer = ""
+        try:
+            amount = round(float(m.group(2).replace(",", ".")), 2)
+        except ValueError:
             continue
-
-        buffer = candidate
-
-    if buffer:
-        parsed = _parse_line_item(buffer)
-        if parsed:
-            items.append(parsed)
-
+        items.append({"name": name, "amount": amount})
     return items
 
 
-def _infer_receipt_description(text: str) -> str:
-    lower = text.lower()
-    if "migros" in lower:
-        return "Migros groceries"
-    if "coop" in lower:
-        return "Coop groceries"
-    if "lidl" in lower:
-        return "Lidl groceries"
-    if "aldi" in lower:
-        return "Aldi groceries"
-    return "Receipt groceries"
-
-
-def _extract_receipt_total_from_text(text: str):
-    matches = []
-    for line in text.splitlines():
-        clean = _normalise_receipt_line(line)
-        if not clean:
-            continue
-        match = _TOTAL_LINE_RE.search(clean)
-        if not match:
-            continue
-        try:
-            amount = round(float(match.group(2).replace(",", ".")), 2)
-        except ValueError:
-            continue
-        matches.append(amount)
-    return matches[-1] if matches else None
-
-
-def _parse_ocr_amount(token: str):
-    token = token.replace("O", "0").replace("o", "0")
-    matches = _OCR_AMOUNT_RE.findall(token)
-    if not matches:
-        return None
-    amount = matches[-1].replace(",", ".")
-    if "." in amount:
-        whole, frac = amount.split(".", 1)
-        frac = frac[:2]
-        try:
-            return round(float(f"{whole}.{frac}"), 2)
-        except ValueError:
-            return None
+def _log_receipt_parse(entry: dict):
     try:
-        return round(float(amount), 2)
-    except ValueError:
-        return None
-
-
-def _parse_receipt_tsv(tsv_text: str, image_width: int):
-    lines = {}
-    for raw_line in tsv_text.splitlines():
-        parts = raw_line.split("\t")
-        if len(parts) != 12 or parts[0] == "level":
-            continue
-        text = parts[11].strip()
-        if not text:
-            continue
-        key = (parts[2], parts[3], parts[4])
-        lines.setdefault(key, []).append(
-            {
-                "text": text,
-                "left": int(parts[6]),
-            }
-        )
-
-    items = []
-    receipt_total = None
-    for words in lines.values():
-        words.sort(key=lambda word: word["left"])
-        joined = " ".join(word["text"] for word in words)
-        upper = joined.upper()
-
-        if "OTAL" in upper or "CHF" in upper:
-            total_candidates = [
-                _parse_ocr_amount(word["text"])
-                for word in words
-                if word["left"] / image_width > 0.45
-            ]
-            total_candidates = [amount for amount in total_candidates if amount is not None]
-            if total_candidates:
-                receipt_total = max(total_candidates)
-            continue
-
-        amount = None
-        for word in words:
-            x_ratio = word["left"] / image_width
-            candidate = _parse_ocr_amount(word["text"])
-            if candidate is not None and x_ratio > 0.62:
-                amount = candidate
-        if amount is None:
-            continue
-
-        name_parts = []
-        for word in words:
-            x_ratio = word["left"] / image_width
-            text = word["text"]
-            if x_ratio < 0.46 and (
-                any(ch.isalpha() for ch in text)
-                or ("." in text and any(ch.isdigit() for ch in text))
-            ):
-                name_parts.append(text)
-
-        name = " ".join(name_parts).strip(" :-–—|/\\")
-        if len(name) < 2 or sum(ch.isalpha() for ch in name) < 2:
-            continue
-        items.append({"name": name, "amount": amount})
-
-    return items, receipt_total
-
-
-def _find_receipt_crop_box(gray_img):
-    width, height = gray_img.size
-    pixels = gray_img.load()
-    bright_threshold = 150
-
-    def row_ratio(y):
-        bright = 0
-        for x in range(width):
-            if pixels[x, y] >= bright_threshold:
-                bright += 1
-        return bright / width
-
-    def col_ratio(x, top, bottom):
-        span = max(bottom - top, 1)
-        bright = 0
-        for y in range(top, bottom):
-            if pixels[x, y] >= bright_threshold:
-                bright += 1
-        return bright / span
-
-    def find_band_forward(limit, getter, ratio_threshold, min_run):
-        run = 0
-        start = 0
-        for idx in range(limit):
-            if getter(idx) >= ratio_threshold:
-                if run == 0:
-                    start = idx
-                run += 1
-                if run >= min_run:
-                    return start
-            else:
-                run = 0
-        return None
-
-    def find_band_backward(limit, getter, ratio_threshold, min_run):
-        run = 0
-        end = limit - 1
-        for idx in range(limit - 1, -1, -1):
-            if getter(idx) >= ratio_threshold:
-                if run == 0:
-                    end = idx
-                run += 1
-                if run >= min_run:
-                    return end + 1
-            else:
-                run = 0
-        return None
-
-    top = find_band_forward(height, row_ratio, 0.28, 12)
-    bottom = find_band_backward(height, row_ratio, 0.28, 12)
-    if top is None or bottom is None or bottom <= top:
-        return None
-
-    left = find_band_forward(width, lambda x: col_ratio(x, top, bottom), 0.18, 8)
-    right = find_band_backward(width, lambda x: col_ratio(x, top, bottom), 0.18, 8)
-    if left is None or right is None or right <= left:
-        return None
-
-    margin_x = max(8, int(width * 0.015))
-    margin_top = max(8, int(height * 0.015))
-    margin_bottom = max(40, int((bottom - top) * 0.12))
-    left = max(0, left - margin_x)
-    right = min(width, right + margin_x)
-    top = max(0, top - margin_top)
-    bottom = min(height, bottom + margin_bottom)
-
-    if (right - left) * (bottom - top) < width * height * 0.30:
-        return None
-    return (left, top, right, bottom)
-
-
-def _build_receipt_ocr_candidates(image_path: str):
-    candidates = []
-    try:
-        with Image.open(image_path) as raw_img:
-            candidates.append((image_path, "raw", raw_img.width))
-    except Exception:
-        candidates.append((image_path, "raw", 0))
-    if Image is None:
-        return candidates
-
-    try:
-        with Image.open(image_path) as img:
-            gray = img.convert("L")
-            crop_box = _find_receipt_crop_box(gray)
-            if not crop_box:
-                return candidates
-
-            cropped = gray.crop(crop_box)
-            scale = 3
-            resized = cropped.resize(
-                (cropped.width * scale, cropped.height * scale),
-                Image.Resampling.LANCZOS,
-            )
-            enhanced = ImageOps.autocontrast(resized)
-            enhanced = enhanced.filter(ImageFilter.SHARPEN)
-
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            tmp_path = tmp.name
-            tmp.close()
-            enhanced.save(tmp_path)
-            logger.info("Local OCR preprocessed crop box: %s", crop_box)
-            candidates.insert(
-                0,
-                (
-                    tmp_path,
-                    f"cropped:{crop_box[0]},{crop_box[1]},{crop_box[2]},{crop_box[3]}",
-                    enhanced.width,
-                ),
-            )
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        with open(RECEIPT_PARSE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as exc:
-        logger.warning("Local OCR preprocessing failed: %s", exc)
+        logger.warning("Receipt parse log write failed: %s", exc)
 
-    return candidates
-
-
-def _pick_global_receipt_total(candidates):
-    totals = [c["receipt_total"] for c in candidates if c.get("receipt_total") is not None]
-    if not totals:
-        return None
-    from collections import Counter
-    counts = Counter(totals)
-    most_common = counts.most_common()
-    top_freq = most_common[0][1]
-    leaders = [value for value, freq in most_common if freq == top_freq]
-    if len(leaders) == 1:
-        return leaders[0]
-    # Tie: pick the median of tied candidates (deterministic with ties broken upward)
-    leaders.sort()
-    return leaders[len(leaders) // 2]
-
-
-def _extract_items_from_receipt_tesseract(image_path: str):
-    tesseract = shutil.which("tesseract")
-    if not tesseract:
-        return None
-
-    raw_candidates = []
-    candidates = _build_receipt_ocr_candidates(image_path)
-    try:
-        for candidate_path, candidate_label, candidate_width in candidates:
-            for psm in ("6", "4"):
-                try:
-                    proc = subprocess.run(
-                        [tesseract, candidate_path, "stdout", "-l", "deu+eng", "--psm", psm],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                except OSError as exc:
-                    logger.warning("Local OCR failed to start: %s", exc)
-                    return None
-
-                if proc.returncode != 0:
-                    logger.warning(
-                        "Local OCR failed (%s, psm=%s): %s",
-                        candidate_label,
-                        psm,
-                        proc.stderr.strip(),
-                    )
-                    continue
-
-                ocr_text = proc.stdout or ""
-                logger.info("Local OCR text (%s, psm=%s): %s", candidate_label, psm, ocr_text)
-                parser_results = []
-                plain_items = parse_receipt_text(ocr_text)
-                if plain_items:
-                    parser_results.append(
-                        ("plain", plain_items, _extract_receipt_total_from_text(ocr_text))
-                    )
-
-                tsv_proc = subprocess.run(
-                    [tesseract, candidate_path, "stdout", "-l", "deu+eng", "--psm", psm, "tsv"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if tsv_proc.returncode == 0:
-                    parser_results.append(
-                        ("tsv", *_parse_receipt_tsv(tsv_proc.stdout or "", candidate_width))
-                    )
-
-                for parser_name, items, receipt_total in parser_results:
-                    if not items:
-                        continue
-                    items_sum = round(sum(item["amount"] for item in items), 2)
-                    raw_candidates.append({
-                        "label": f"{candidate_label}/psm={psm}/parser={parser_name}",
-                        "items": items,
-                        "receipt_total": receipt_total,
-                        "items_sum": items_sum,
-                        "description": _infer_receipt_description(ocr_text),
-                    })
-    finally:
-        for candidate_path, _, _ in candidates:
-            if candidate_path != image_path and os.path.exists(candidate_path):
-                os.remove(candidate_path)
-
-    if not raw_candidates:
-        return None
-
-    global_total = _pick_global_receipt_total(raw_candidates)
-    logger.info(
-        "Local OCR collected %d candidates, global receipt_total=%s",
-        len(raw_candidates),
-        f"{global_total:.2f}" if global_total is not None else "None",
-    )
-
-    def sort_key(c):
-        if global_total is not None:
-            return (abs(c["items_sum"] - global_total), -len(c["items"]))
-        return (0.0, -len(c["items"]))
-
-    raw_candidates.sort(key=sort_key)
-    for c in raw_candidates:
-        mismatch = abs(c["items_sum"] - global_total) if global_total is not None else None
-        logger.info(
-            "Local OCR candidate %s: items=%d items_sum=%.2f own_total=%s mismatch_vs_global=%s",
-            c["label"],
-            len(c["items"]),
-            c["items_sum"],
-            f"{c['receipt_total']:.2f}" if c["receipt_total"] is not None else "None",
-            f"{mismatch:.2f}" if mismatch is not None else "None",
-        )
-
-    best = raw_candidates[0]
-    return {
-        "description": best["description"],
-        "receipt_total": global_total if global_total is not None else best["receipt_total"],
-        "items": best["items"],
-    }
 
 
 def _receipt_prompt_text(receipt_total=None, items_sum=None, prior_json=None):
     prompt = (
         "Extract every purchased line item from this receipt and suggest a short expense description.\n"
         "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
-        '{"description": "Migros groceries", "receipt_total": 129.50, "items": [{"name": "Product name", "qty": 1, "unit_price": 9.95, "amount": 9.95}, ...]}\n\n'
+        '{"description": "Migros groceries", "total_observed": 129.50, "items": [{"name": "Product name", "quantity": 1, "unit_price": 9.95, "line_total_observed": 9.95}, ...]}\n\n'
         "Rules:\n"
         "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
-        "- receipt_total: the grand total printed at the bottom (e.g. 'TOTAL CHF 129.50') — copy exactly as a number\n"
-        "- qty: MUST be the exact Menge column value from the receipt (can be fractional for weighted items, e.g. 0.275)\n"
-        "- For multi-buy items, never default qty to 1: if the receipt shows 2 x CHF 2.00, return qty: 2, unit_price: 2.00, amount: 4.00\n"
+        "- total_observed: the grand total printed at the bottom (e.g. 'TOTAL CHF 129.50') — copy exactly as a number\n"
+        "- quantity: MUST be the exact Menge column value from the receipt (can be fractional for weighted items, e.g. 0.275)\n"
+        "- For multi-buy items, never default quantity to 1: if the receipt shows 2 x CHF 2.00, return quantity: 2, unit_price: 2.00\n"
         "- unit_price: the Preis column value (unit price or per-kg price)\n"
-        "- amount: qty × unit_price — always compute this yourself for every item\n"
-        "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
+        "- line_total_observed: the line total as printed on the receipt — copy exactly, do not compute\n"
+        "- For discounted items: unit_price and line_total_observed should reflect the discounted price (Aktion column), not the original\n"
         "- If the same product name appears on multiple lines (different weights), list EACH as a separate item; append weight to disambiguate\n"
         "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
-        "- Keep item names short but recognisable\n"
-        "- Before returning, verify sum(amount) against receipt_total and fix obvious qty/amount mistakes (especially multi-buy lines)"
+        "- Keep item names short but recognisable"
     )
     if receipt_total is not None and items_sum is not None and prior_json:
         prompt += (
             "\n\nRe-check carefully because the first extraction does not reconcile.\n"
             f"- Printed receipt total: CHF {receipt_total:.2f}\n"
-            f"- Current sum of item amounts: CHF {items_sum:.2f}\n"
+            f"- Computed sum of line items: CHF {items_sum:.2f}\n"
             f"- First extracted JSON: {prior_json}\n"
-            "- Focus on missed duplicate lines and wrong qty values on multi-buy items.\n"
-            "- If a line shows multiple units of the same item, return the correct qty instead of 1.\n"
+            "- Focus on missed duplicate lines and wrong quantity values on multi-buy items.\n"
             "- Return a corrected full JSON object for the entire receipt, not a diff."
         )
-    return prompt
-
-
-def _receipt_names_prompt_text(expected_count=None):
-    prompt = (
-        "Read this grocery receipt and extract ONLY the purchased item names in top-to-bottom order, plus a short expense description.\n"
-        "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
-        '{"description": "Migros groceries", "items": [{"name": "Product name"}, ...]}\n\n'
-        "Rules:\n"
-        "- description: 2-4 words, store name + category\n"
-        "- items: one object per purchased line item, in the same visual order as the receipt\n"
-        "- Include repeated products as separate entries if they appear on separate lines\n"
-        "- Keep names short but recognisable\n"
-        "- Do not include totals, taxes, loyalty lines, or explanations\n"
-        "- Ignore prices and amounts completely; names only"
-    )
-    if expected_count is not None:
-        prompt += f"\n- The receipt should have about {expected_count} purchased line items"
     return prompt
 
 
@@ -1281,7 +838,7 @@ def _parse_receipt_ocr_response(raw: str, log_prefix: str):
     parsed = json.loads(raw_json)
     items = parsed["items"]
     description = str(parsed.get("description", "")).strip()
-    receipt_total = parsed.get("receipt_total")
+    receipt_total = parsed.get("total_observed")
     if receipt_total is not None:
         try:
             receipt_total = round(float(receipt_total), 2)
@@ -1290,236 +847,64 @@ def _parse_receipt_ocr_response(raw: str, log_prefix: str):
     return raw_json, items, description, receipt_total
 
 
-def _parse_receipt_names_response(raw: str, log_prefix: str):
-    start = raw.index("{")
-    end = raw.rindex("}") + 1
-    raw_json = raw[start:end]
-    logger.info("%s raw JSON: %s", log_prefix, raw_json)
-    parsed = json.loads(raw_json)
-    description = str(parsed.get("description", "")).strip()
-    items = parsed.get("items") or []
-    names = []
-    for item in items:
-        if not isinstance(item, dict) or not item.get("name"):
-            continue
-        name = str(item["name"]).strip()
-        if name:
-            names.append(name)
-    return raw_json, description, names
-
-
-def _cleanup_names_via_text_api(local_items, receipt_total=None):
-    """Send raw OCR rows to OpenAI as text-only (no image) and ask for cleaned names.
-
-    Returns (description, cleaned_names) on success, (None, None) on failure or count mismatch.
-    """
-    if not _openai_lib or not OPENAI_API_KEY or not local_items:
-        return None, None
-
-    rows = "\n".join(
-        f"{idx + 1}. {item.get('name', '').strip()} | CHF {float(item.get('amount', 0)):.2f}"
-        for idx, item in enumerate(local_items)
-    )
-    total_hint = (
-        f"\nReceipt total: CHF {receipt_total:.2f}." if receipt_total is not None else ""
-    )
-    prompt = (
-        "These are raw OCR rows from a grocery receipt. The amounts are already correct.\n"
-        "Return ONLY a JSON object with cleaned, recognisable item names in the same order.\n"
-        f"You MUST return exactly {len(local_items)} items — same count, same order.\n"
-        "Do not invent items, do not merge, do not split. Just clean obvious OCR errors in the names.\n"
-        f"Format: {{\"description\": \"Migros groceries\", \"items\": [{{\"name\": \"Cleaned name\"}}, ...]}}\n"
-        "description: 2-4 words, store name + category if you can infer it.\n"
-        f"Raw rows:\n{rows}{total_hint}"
-    )
-
-    try:
-        client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=768,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.choices[0].message.content.strip()
-        _, description, cleaned = _parse_receipt_names_response(raw, "Receipt names text-only")
-    except Exception as exc:
-        logger.warning("Text-only name cleanup failed: %s", exc)
-        return None, None
-
-    if len(cleaned) != len(local_items):
-        logger.info(
-            "Text-only name cleanup count mismatch: got %d, expected %d — discarding",
-            len(cleaned),
-            len(local_items),
-        )
-        return None, None
-
-    return description, cleaned
-
-
 def _normalise_receipt_items(items, log_prefix: str):
     normalised = []
     for idx, i in enumerate(items, start=1):
-        if not isinstance(i, dict) or "name" not in i or i.get("amount") is None:
+        if not isinstance(i, dict) or "name" not in i or i.get("unit_price") is None:
             continue
         name = str(i["name"]).strip()
-        raw_qty = i.get("qty")
+        raw_quantity = i.get("quantity")
         raw_unit_price = i.get("unit_price")
-        raw_amount = i.get("amount")
-        amount = round(float(raw_amount), 2)
-        qty = None
-        unit_price = None
-        computed = None
-        corrected = False
+        raw_line_total_observed = i.get("line_total_observed")
         try:
-            qty = float(raw_qty or 1)
-            unit_price = float(raw_unit_price or 0)
-            if unit_price > 0 and qty == int(qty) and int(qty) > 1:
-                computed = round(qty * unit_price, 2)
-                if abs(computed - amount) > 0.005:
-                    amount = computed
-                    corrected = True
+            quantity = float(raw_quantity) if raw_quantity is not None else 1.0
+            unit_price = float(raw_unit_price)
+        except (TypeError, ValueError):
+            continue
+        computed = round(quantity * unit_price, 2)
+        observed = None
+        try:
+            if raw_line_total_observed is not None:
+                observed = round(float(raw_line_total_observed), 2)
         except (TypeError, ValueError):
             pass
         logger.info(
-            "%s item %02d normalized: name=%r qty=%r unit_price=%r amount=%r computed=%r corrected=%s final=%.2f",
+            "%s item %02d: name=%r quantity=%r unit_price=%r line_total_observed=%r computed=%.2f",
             log_prefix,
             idx,
             name,
-            raw_qty,
+            raw_quantity,
             raw_unit_price,
-            raw_amount,
+            raw_line_total_observed,
             computed,
-            corrected,
-            amount,
         )
-        normalised.append({"name": name, "amount": amount})
+        normalised.append({"name": name, "amount": computed, "_observed": observed})
     return normalised
 
 
-def _merge_local_amounts_with_vision_names(local_items, vision_items, log_prefix: str):
-    if not local_items or not vision_items:
-        return local_items
-
-    if all(item.get("amount") is None for item in vision_items):
-        merged = []
-        replaced = 0
-        for idx, item in enumerate(local_items):
-            new_item = dict(item)
-            if idx < len(vision_items):
-                vision_name = str(vision_items[idx].get("name") or "").strip()
-                if vision_name:
-                    new_item["name"] = vision_name
-                    replaced += 1
-            merged.append(new_item)
-        logger.info(
-            "%s merged local amounts with vision names by order: local=%d vision=%d replaced=%d",
-            log_prefix,
-            len(local_items),
-            len(vision_items),
-            replaced,
-        )
-        return merged
-
-    local_amounts = [item["amount"] for item in local_items]
-    vision_amounts = []
-    for item in vision_items:
-        try:
-            vision_amounts.append(round(float(item.get("amount")), 2))
-        except (TypeError, ValueError):
-            vision_amounts.append(None)
-
-    n = len(local_items)
-    m = len(vision_items)
-    gap_cost = 1.25
-    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
-    choice = [[None] * (m + 1) for _ in range(n + 1)]
-
-    for i in range(1, n + 1):
-        dp[i][0] = i * gap_cost
-        choice[i][0] = "up"
-    for j in range(1, m + 1):
-        dp[0][j] = j * gap_cost
-        choice[0][j] = "left"
-
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            local_amount = local_amounts[i - 1]
-            vision_amount = vision_amounts[j - 1]
-            if vision_amount is None:
-                match_cost = 3.0
-            else:
-                match_cost = min(abs(local_amount - vision_amount), 5.0)
-            options = [
-                (dp[i - 1][j - 1] + match_cost, "diag"),
-                (dp[i - 1][j] + gap_cost, "up"),
-                (dp[i][j - 1] + gap_cost, "left"),
-            ]
-            best_cost, best_choice = min(options, key=lambda option: option[0])
-            dp[i][j] = best_cost
-            choice[i][j] = best_choice
-
-    matches = {}
-    i, j = n, m
-    while i > 0 and j > 0:
-        step = choice[i][j]
-        if step == "diag":
-            matches[i - 1] = j - 1
-            i -= 1
-            j -= 1
-        elif step == "up":
-            i -= 1
-        else:
-            j -= 1
-
-    merged = []
-    replaced = 0
-    for idx, item in enumerate(local_items):
-        new_item = dict(item)
-        vision_idx = matches.get(idx)
-        if vision_idx is not None:
-            vision_name = str(vision_items[vision_idx].get("name") or "").strip()
-            if vision_name:
-                new_item["name"] = vision_name
-                replaced += 1
-        merged.append(new_item)
-
-    logger.info(
-        "%s merged local amounts with vision names: local=%d vision=%d replaced=%d alignment_cost=%.2f",
-        log_prefix,
-        n,
-        m,
-        replaced,
-        dp[n][m],
+def _vision_call(client, image_data: str, media_type: str, prompt_text: str) -> str:
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{media_type};base64,{image_data}"},
+                },
+                {"type": "text", "text": prompt_text},
+            ],
+        }]
     )
-    return merged
+    return response.choices[0].message.content.strip()
 
 
 def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     media_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
 
-    if RECEIPT_LOCAL_OCR_ENABLED:
-        local_result = _extract_items_from_receipt_tesseract(image_path)
-        if local_result:
-            # Trust local amounts. Only clean names — text-only API first (cheap, no image tokens).
-            receipt_total = local_result.get("receipt_total")
-            cleaned_description, cleaned_names = _cleanup_names_via_text_api(
-                local_result["items"], receipt_total=receipt_total
-            )
-            if cleaned_names:
-                local_result["items"] = [
-                    {**item, "name": cleaned_names[idx]}
-                    for idx, item in enumerate(local_result["items"])
-                ]
-                if cleaned_description:
-                    local_result["description"] = cleaned_description
-            return local_result
-    else:
-        logger.info("Local OCR disabled; using single-pass vision receipt extraction.")
-
-    # Use single-pass vision extraction (default path).
     if not _openai_lib or not OPENAI_API_KEY:
-        raise ReceiptParsingError("Receipt scanning is not configured (missing OCR backend).")
+        raise ReceiptParsingError("Receipt scanning is not configured (missing OPENAI_API_KEY).")
 
     try:
         with open(image_path, "rb") as f:
@@ -1528,48 +913,90 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
         raise ReceiptParsingError("Failed to read the receipt image.") from exc
 
     client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=1536,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{media_type};base64,{image_data}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": _receipt_prompt_text(),
-                    },
-                ],
-            }]
+    ts = datetime.now(pytz.UTC).isoformat()
+    log_entry: dict = {"ts": ts, "image_path": image_path, "passes": []}
+
+    def _call_and_parse(pass_label: str, prompt_text: str):
+        try:
+            raw = _vision_call(client, image_data, media_type, prompt_text)
+        except Exception as exc:
+            raise ReceiptParsingError(f"Vision API error ({pass_label}): {exc}") from exc
+        try:
+            raw_json, items, description, receipt_total = _parse_receipt_ocr_response(
+                raw, f"Receipt {pass_label}"
+            )
+        except (ValueError, json.JSONDecodeError, KeyError) as exc:
+            raise ReceiptParsingError(
+                f"Could not parse API response as JSON ({pass_label}): {exc}"
+            ) from exc
+        if not items:
+            raise ReceiptParsingError(f"No line items found in receipt ({pass_label}).")
+        normalised = _normalise_receipt_items(items, f"Receipt {pass_label}")
+        if not normalised:
+            raise ReceiptParsingError(f"No valid line items after normalisation ({pass_label}).")
+        items_sum = round(sum(item["amount"] for item in normalised), 2)
+        gap = abs(items_sum - receipt_total) if receipt_total is not None else None
+        log_entry["passes"].append({
+            "pass": pass_label,
+            "raw_json": raw_json,
+            "item_count": len(normalised),
+            "items_sum": items_sum,
+            "receipt_total": receipt_total,
+            "gap": gap,
+        })
+        logger.info(
+            "Receipt %s: items=%d items_sum=%.2f receipt_total=%s gap=%s",
+            pass_label,
+            len(normalised),
+            items_sum,
+            f"{receipt_total:.2f}" if receipt_total is not None else "None",
+            f"{gap:.2f}" if gap is not None else "None",
         )
-    except Exception as exc:
-        raise ReceiptParsingError(f"Vision API error: {exc}") from exc
+        return description, receipt_total, normalised, items_sum, gap, raw_json
 
-    raw = response.choices[0].message.content.strip()
-    try:
-        _, items, description, receipt_total = _parse_receipt_ocr_response(raw, "Receipt OCR pass1")
-    except (ValueError, json.JSONDecodeError, KeyError) as exc:
-        raise ReceiptParsingError(f"Could not parse API response as JSON: {exc}") from exc
+    description, receipt_total, normalised, items_sum, gap, raw_json = _call_and_parse(
+        "pass1", _receipt_prompt_text()
+    )
 
-    if not items:
-        raise ReceiptParsingError("No line items found in receipt.")
+    # Retry once if sum deviates beyond tolerance and we have a total to compare
+    if receipt_total is not None and gap is not None and gap > RECEIPT_TOLERANCE_CHF:
+        logger.info(
+            "Receipt pass1 gap %.2f > tolerance %.2f — retrying with mismatch context",
+            gap,
+            RECEIPT_TOLERANCE_CHF,
+        )
+        try:
+            description2, receipt_total2, normalised2, items_sum2, gap2, _ = _call_and_parse(
+                "pass2",
+                _receipt_prompt_text(
+                    receipt_total=receipt_total,
+                    items_sum=items_sum,
+                    prior_json=raw_json,
+                ),
+            )
+            # Accept pass2 only if it's a genuine improvement
+            if gap2 is None or (gap is not None and gap2 < gap):
+                description, receipt_total, normalised, items_sum, gap = (
+                    description2, receipt_total2, normalised2, items_sum2, gap2
+                )
+                logger.info("Receipt pass2 accepted (gap improved to %s)", f"{gap2:.2f}" if gap2 is not None else "None")
+            else:
+                logger.info("Receipt pass2 not better (gap %s vs %s) — keeping pass1", f"{gap2:.2f}" if gap2 is not None else "None", f"{gap:.2f}" if gap is not None else "None")
+        except ReceiptParsingError as exc:
+            logger.warning("Receipt pass2 failed: %s — keeping pass1", exc)
 
-    try:
-        normalised = _normalise_receipt_items(items, "Receipt OCR pass1")
-    except (TypeError, ValueError, KeyError) as exc:
-        raise ReceiptParsingError(f"Failed to parse item data: {exc}") from exc
+    log_entry["final_gap"] = gap
+    log_entry["accepted_pass"] = log_entry["passes"][-1]["pass"] if log_entry["passes"] else None
+    _log_receipt_parse(log_entry)
 
-    if not normalised:
-        raise ReceiptParsingError("No valid line items found in receipt.")
-
+    # Strip internal _observed field before returning
+    clean_items = [{"name": item["name"], "amount": item["amount"]} for item in normalised]
     return {
         "description": description,
         "receipt_total": receipt_total,
-        "items": normalised,
+        "items_sum": items_sum,
+        "gap": gap,
+        "items": clean_items,
     }
 
 
@@ -1774,10 +1201,15 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         )
         return EXPENSE_RECEIPT_MANUAL
 
-    items_sum = round(sum(item["amount"] for item in items), 2)
     receipt_total = result.get("receipt_total") if isinstance(result, dict) else None
+    items_sum = result.get("items_sum") if isinstance(result, dict) else None
+    if items_sum is None:
+        items_sum = round(sum(item["amount"] for item in items), 2)
+    gap = result.get("gap") if isinstance(result, dict) else None
+    if gap is None and receipt_total is not None:
+        gap = abs(items_sum - receipt_total)
     suggested_total = receipt_total if receipt_total else items_sum
-    has_mismatch = receipt_total is not None and abs(items_sum - receipt_total) > 0.02
+    has_mismatch = receipt_total is not None and gap is not None and gap > 0.02
 
     context.user_data["mode"] = "receipt"
     context.user_data["receipt_items"] = items
@@ -1792,11 +1224,10 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         resize_keyboard=True,
     )
     if has_mismatch:
-        mismatch = abs(items_sum - receipt_total)
         total_prompt = (
             f"Found {len(items)} items. Items sum: <b>CHF {items_sum:.2f}</b> | "
             f"Receipt total: <b>CHF {receipt_total:.2f}</b>\n"
-            f"⚠️ <b>CHF {mismatch:.2f}</b> mismatch — some item amounts may be off.\n"
+            f"⚠️ <b>CHF {gap:.2f}</b> gap — some item amounts may be off.\n"
             "Tap to confirm or type the correct total:"
         )
     else:
@@ -1851,7 +1282,7 @@ async def expense_receipt_invalid(update: Update, context: CallbackContext) -> i
 
 async def expense_receipt_manual_items(update: Update, context: CallbackContext) -> int:
     raw = update.message.text or ""
-    items = parse_receipt_text(raw)
+    items = _parse_manual_receipt_items(raw)
     if not items:
         await update.message.reply_text(
             "I couldn't understand any items. Use lines like 'Bread - 3.50'."
