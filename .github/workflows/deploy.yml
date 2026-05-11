@@ -22,5 +22,11 @@ jobs:
             git fetch origin main
             git checkout main
             git pull --ff-only origin main
+            sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              tesseract-ocr \
+              tesseract-ocr-deu \
+              tesseract-ocr-eng
             ./venv/bin/python -m pip install -q -r requirements.txt
             systemctl restart wg_cop
