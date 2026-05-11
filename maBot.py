@@ -355,7 +355,6 @@ EXPENSE_LIST_LIMIT = 20
     EXPENSE_SPLIT,
     EXPENSE_RECEIPT,
     EXPENSE_RECEIPT_REVIEW,
-    EXPENSE_RECEIPT_MANUAL,
     EXPENSE_RECEIPT_CONFIRM_TOTAL,
 ) = range(9)
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
@@ -771,24 +770,6 @@ def build_receipt_items_kb(items, selected):
 
 
 RECEIPT_PARSE_LOG = os.path.join(BACKUP_DIR, "receipt_parse_log.jsonl")
-_MANUAL_ITEM_RE = re.compile(r"^(.+?)[\s\-:]+(\d+[.,]\d{1,2})\s*$")
-
-
-def _parse_manual_receipt_items(text: str):
-    items = []
-    for line in text.splitlines():
-        m = _MANUAL_ITEM_RE.match(line.strip())
-        if not m:
-            continue
-        name = m.group(1).strip(" -:")
-        if not name:
-            continue
-        try:
-            amount = round(float(m.group(2).replace(",", ".")), 2)
-        except ValueError:
-            continue
-        items.append({"name": name, "amount": amount})
-    return items
 
 
 def _log_receipt_parse(entry: dict):
@@ -1182,12 +1163,13 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         except ReceiptParsingError as exc:
             logger.info("Receipt OCR failed: %s", exc)
             await analysing_msg.delete()
+            context.user_data["mode"] = "manual"
             await update.message.reply_text(
-                "I couldn't read the receipt automatically."
-                "\nPlease send the items as text in the format 'Item - price',"
-                " one per line."
+                "Scan failed — switching to manual entry.\n"
+                "Enter a short description (e.g. 'Groceries Migros'):",
+                reply_markup=ReplyKeyboardRemove(),
             )
-            return EXPENSE_RECEIPT_MANUAL
+            return EXPENSE_DESCRIPTION
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -1196,10 +1178,13 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
     items = result.get("items", []) if isinstance(result, dict) else result
     if not items:
         await analysing_msg.delete()
+        context.user_data["mode"] = "manual"
         await update.message.reply_text(
-            "I couldn't find any purchasable items. Please send them as text, one per line."
+            "No items found — switching to manual entry.\n"
+            "Enter a short description (e.g. 'Groceries Migros'):",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        return EXPENSE_RECEIPT_MANUAL
+        return EXPENSE_DESCRIPTION
 
     receipt_total = result.get("receipt_total") if isinstance(result, dict) else None
     items_sum = result.get("items_sum") if isinstance(result, dict) else None
@@ -1278,28 +1263,6 @@ async def expense_receipt_invalid(update: Update, context: CallbackContext) -> i
         "Please send a photo or image of the receipt, or type Cancel to abort."
     )
     return EXPENSE_RECEIPT
-
-
-async def expense_receipt_manual_items(update: Update, context: CallbackContext) -> int:
-    raw = update.message.text or ""
-    items = _parse_manual_receipt_items(raw)
-    if not items:
-        await update.message.reply_text(
-            "I couldn't understand any items. Use lines like 'Bread - 3.50'."
-        )
-        return EXPENSE_RECEIPT_MANUAL
-
-    context.user_data["mode"] = "receipt"
-    context.user_data["receipt_items"] = items
-    context.user_data["receipt_selected"] = set(range(len(items)))
-
-    await update.message.reply_text(
-        build_receipt_items_text(items, context.user_data["receipt_selected"]),
-        reply_markup=build_receipt_items_kb(
-            items, context.user_data["receipt_selected"]
-        ),
-    )
-    return EXPENSE_RECEIPT_REVIEW
 
 
 async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
@@ -3102,12 +3065,6 @@ def main():
             ],
             EXPENSE_RECEIPT_CONFIRM_TOTAL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_confirm_total),
-            ],
-            EXPENSE_RECEIPT_MANUAL: [
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, expense_receipt_manual_items
-                )
             ],
             EXPENSE_RECEIPT_REVIEW: [
                 CallbackQueryHandler(
