@@ -1024,6 +1024,24 @@ def _receipt_prompt_text(receipt_total=None, items_sum=None, prior_json=None):
     return prompt
 
 
+def _receipt_names_prompt_text(expected_count=None):
+    prompt = (
+        "Read this grocery receipt and extract ONLY the purchased item names in top-to-bottom order, plus a short expense description.\n"
+        "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
+        '{"description": "Migros groceries", "items": [{"name": "Product name"}, ...]}\n\n'
+        "Rules:\n"
+        "- description: 2-4 words, store name + category\n"
+        "- items: one object per purchased line item, in the same visual order as the receipt\n"
+        "- Include repeated products as separate entries if they appear on separate lines\n"
+        "- Keep names short but recognisable\n"
+        "- Do not include totals, taxes, loyalty lines, or explanations\n"
+        "- Ignore prices and amounts completely; names only"
+    )
+    if expected_count is not None:
+        prompt += f"\n- The receipt should have about {expected_count} purchased line items"
+    return prompt
+
+
 def _parse_receipt_ocr_response(raw: str, log_prefix: str):
     start = raw.index("{")
     end = raw.rindex("}") + 1
@@ -1039,6 +1057,24 @@ def _parse_receipt_ocr_response(raw: str, log_prefix: str):
         except (TypeError, ValueError):
             receipt_total = None
     return raw_json, items, description, receipt_total
+
+
+def _parse_receipt_names_response(raw: str, log_prefix: str):
+    start = raw.index("{")
+    end = raw.rindex("}") + 1
+    raw_json = raw[start:end]
+    logger.info("%s raw JSON: %s", log_prefix, raw_json)
+    parsed = json.loads(raw_json)
+    description = str(parsed.get("description", "")).strip()
+    items = parsed.get("items") or []
+    names = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item["name"]).strip()
+        if name:
+            names.append(name)
+    return raw_json, description, names
 
 
 def _normalise_receipt_items(items, log_prefix: str):
@@ -1081,14 +1117,105 @@ def _normalise_receipt_items(items, log_prefix: str):
     return normalised
 
 
+def _merge_local_amounts_with_vision_names(local_items, vision_items, log_prefix: str):
+    if not local_items or not vision_items:
+        return local_items
+
+    if all(item.get("amount") is None for item in vision_items):
+        merged = []
+        replaced = 0
+        for idx, item in enumerate(local_items):
+            new_item = dict(item)
+            if idx < len(vision_items):
+                vision_name = str(vision_items[idx].get("name") or "").strip()
+                if vision_name:
+                    new_item["name"] = vision_name
+                    replaced += 1
+            merged.append(new_item)
+        logger.info(
+            "%s merged local amounts with vision names by order: local=%d vision=%d replaced=%d",
+            log_prefix,
+            len(local_items),
+            len(vision_items),
+            replaced,
+        )
+        return merged
+
+    local_amounts = [item["amount"] for item in local_items]
+    vision_amounts = []
+    for item in vision_items:
+        try:
+            vision_amounts.append(round(float(item.get("amount")), 2))
+        except (TypeError, ValueError):
+            vision_amounts.append(None)
+
+    n = len(local_items)
+    m = len(vision_items)
+    gap_cost = 1.25
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    choice = [[None] * (m + 1) for _ in range(n + 1)]
+
+    for i in range(1, n + 1):
+        dp[i][0] = i * gap_cost
+        choice[i][0] = "up"
+    for j in range(1, m + 1):
+        dp[0][j] = j * gap_cost
+        choice[0][j] = "left"
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            local_amount = local_amounts[i - 1]
+            vision_amount = vision_amounts[j - 1]
+            if vision_amount is None:
+                match_cost = 3.0
+            else:
+                match_cost = min(abs(local_amount - vision_amount), 5.0)
+            options = [
+                (dp[i - 1][j - 1] + match_cost, "diag"),
+                (dp[i - 1][j] + gap_cost, "up"),
+                (dp[i][j - 1] + gap_cost, "left"),
+            ]
+            best_cost, best_choice = min(options, key=lambda option: option[0])
+            dp[i][j] = best_cost
+            choice[i][j] = best_choice
+
+    matches = {}
+    i, j = n, m
+    while i > 0 and j > 0:
+        step = choice[i][j]
+        if step == "diag":
+            matches[i - 1] = j - 1
+            i -= 1
+            j -= 1
+        elif step == "up":
+            i -= 1
+        else:
+            j -= 1
+
+    merged = []
+    replaced = 0
+    for idx, item in enumerate(local_items):
+        new_item = dict(item)
+        vision_idx = matches.get(idx)
+        if vision_idx is not None:
+            vision_name = str(vision_items[vision_idx].get("name") or "").strip()
+            if vision_name:
+                new_item["name"] = vision_name
+                replaced += 1
+        merged.append(new_item)
+
+    logger.info(
+        "%s merged local amounts with vision names: local=%d vision=%d replaced=%d alignment_cost=%.2f",
+        log_prefix,
+        n,
+        m,
+        replaced,
+        dp[n][m],
+    )
+    return merged
+
+
 def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
-    local_result = _extract_items_from_receipt_tesseract(image_path)
-    if local_result:
-        return local_result
-
-    if not _openai_lib or not OPENAI_API_KEY:
-        raise ReceiptParsingError("Receipt scanning is not configured (missing OCR backend).")
-
     try:
         with open(image_path, "rb") as f:
             image_data = base64.standard_b64encode(f.read()).decode("utf-8")
@@ -1096,6 +1223,47 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
         raise ReceiptParsingError("Failed to read the receipt image.") from exc
 
     media_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
+
+    local_result = _extract_items_from_receipt_tesseract(image_path)
+    if local_result and _openai_lib and OPENAI_API_KEY:
+        try:
+            client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
+            names_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                max_tokens=1024,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media_type};base64,{image_data}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": _receipt_names_prompt_text(expected_count=len(local_result["items"])),
+                        },
+                    ],
+                }],
+            )
+            names_raw = names_response.choices[0].message.content.strip()
+            _, vision_description, vision_names = _parse_receipt_names_response(
+                names_raw, "Receipt names pass1"
+            )
+            vision_name_items = [{"name": name, "amount": None} for name in vision_names]
+            local_result["items"] = _merge_local_amounts_with_vision_names(
+                local_result["items"], vision_name_items, "Receipt names pass1"
+            )
+            if vision_description:
+                local_result["description"] = vision_description
+        except Exception as exc:
+            logger.warning("Receipt names pass failed; keeping local OCR names: %s", exc)
+        return local_result
+
+    if local_result:
+        return local_result
+
+    if not _openai_lib or not OPENAI_API_KEY:
+        raise ReceiptParsingError("Receipt scanning is not configured (missing OCR backend).")
 
     client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
     def run_vision_pass(prompt_text: str):
