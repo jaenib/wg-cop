@@ -97,6 +97,7 @@ def load_data():
             "penalties": {},
             "members": [],
             "chronicler_backup": {"greeting_sent": False, "last_sent": None},
+            "weekly_report_meta": {"last_sent": None},
         }
         with open(DATA_FILE, "w") as file:
             json.dump(default_data, file, indent=4)
@@ -109,6 +110,8 @@ def load_data():
         }
     if "chore_log" not in data:
         data["chore_log"] = []
+    if "weekly_report_meta" not in data:
+        data["weekly_report_meta"] = {"last_sent": None}
     
     # Migrate members from strings to objects with status field
     if data.get("members"):
@@ -2783,30 +2786,18 @@ def _build_weekly_report(data):
 
 async def check_weekly_penalties(context: CallbackContext) -> None:
     data = load_data()
+    await _send_weekly_report(context, data)
 
-    if "group_chat_id" not in data:
-        logger.warning("No group chat ID set for weekly reports")
+
+async def send_missed_weekly_report_on_startup(context: CallbackContext) -> None:
+    data = load_data()
+    if not _weekly_report_is_due(data):
         return
 
-    group_id = data["group_chat_id"]
-
-    if not data.get("members") or not data.get("chores"):
-        try:
-            await context.bot.send_message(
-                chat_id=group_id,
-                text="Weekly Report: Not enough data yet. Add members and log some chores first.",
-            )
-        except TelegramError as e:
-            logger.error(f"Failed to send weekly report: {e}")
-        return
-
-    report = _build_weekly_report(data)
-    save_data(data)
-
-    try:
-        await context.bot.send_message(chat_id=group_id, text=report)
-    except TelegramError as e:
-        logger.error(f"Failed to send weekly report: {e}")
+    logger.info(
+        "Weekly report was missed at the scheduled time; sending catch-up report on startup"
+    )
+    await _send_weekly_report(context, data)
 
 
 async def admin_trigger_report(update: Update, context: CallbackContext) -> None:
@@ -2991,6 +2982,65 @@ def _get_chronicler_meta(data):
     )
 
 
+def _get_weekly_report_meta(data):
+    return data.setdefault("weekly_report_meta", {"last_sent": None})
+
+
+def _weekly_report_target_for_week(reference=None):
+    tz = pytz.timezone("Europe/Berlin")
+    now = reference or datetime.now(tz)
+    monday = now - timedelta(days=now.weekday())
+    return monday.replace(hour=9, minute=30, second=0, microsecond=0)
+
+
+def _parse_berlin_datetime(value):
+    if not value:
+        return None
+
+    tz = pytz.timezone("Europe/Berlin")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return tz.localize(parsed)
+    return parsed.astimezone(tz)
+
+
+def _weekly_report_is_due(data, reference=None):
+    tz = pytz.timezone("Europe/Berlin")
+    now = reference or datetime.now(tz)
+    target = _weekly_report_target_for_week(now)
+    last_sent = _parse_berlin_datetime(_get_weekly_report_meta(data).get("last_sent"))
+    return now >= target and (last_sent is None or last_sent < target)
+
+
+async def _send_weekly_report(context: CallbackContext, data) -> bool:
+    group_id = data.get("group_chat_id")
+    if not group_id:
+        logger.warning("No group chat ID set for weekly reports")
+        return False
+
+    if not data.get("members") or not data.get("chores"):
+        report = "Weekly Report: Not enough data yet. Add members and log some chores first."
+    else:
+        report = _build_weekly_report(data)
+        save_data(data)
+
+    try:
+        await context.bot.send_message(chat_id=group_id, text=report)
+    except TelegramError as e:
+        logger.error(f"Failed to send weekly report: {e}")
+        return False
+
+    _get_weekly_report_meta(data)["last_sent"] = datetime.now(
+        pytz.timezone("Europe/Berlin")
+    ).isoformat()
+    save_data(data)
+    return True
+
+
 async def send_initial_chronicler_backup(context: CallbackContext) -> None:
     chronicler_chat_id = _get_chronicler_chat_id()
     if not chronicler_chat_id:
@@ -3078,7 +3128,7 @@ def setup_chronicler_backup_job(application):
 
 def setup_weekly_job(application):
     target_time = datetime.now(pytz.timezone("Europe/Berlin"))
-    target_time = target_time.replace(hour=9, minute=0, second=0, microsecond=0)
+    target_time = target_time.replace(hour=9, minute=30, second=0, microsecond=0)
 
     if target_time.weekday() != 0 or datetime.now(pytz.timezone("Europe/Berlin")) > target_time:
         days_until_monday = (7 - target_time.weekday()) % 7
@@ -3094,6 +3144,11 @@ def setup_weekly_job(application):
         interval=timedelta(days=7).total_seconds(),
         first=seconds_until_target,
         name="weekly_penalty_check",
+        job_kwargs={
+            "misfire_grace_time": 600,
+            "coalesce": True,
+            "max_instances": 1,
+        },
     )
     logger.info(
         f"Weekly report scheduled for {target_time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -3491,6 +3546,11 @@ def main():
     )
 
     setup_weekly_job(app)
+    app.job_queue.run_once(
+        send_missed_weekly_report_on_startup,
+        when=0,
+        name="weekly_report_catchup",
+    )
     setup_chronicler_backup_job(app)
 
     # Daily noon check for WG-Höck reminder
