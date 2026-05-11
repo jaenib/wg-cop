@@ -722,7 +722,9 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     try:
         start = raw.index("{")
         end = raw.rindex("}") + 1
-        parsed = json.loads(raw[start:end])
+        raw_json = raw[start:end]
+        logger.debug("Receipt OCR raw JSON: %s", raw_json)
+        parsed = json.loads(raw_json)
         items = parsed["items"]
         description = str(parsed.get("description", "")).strip()
         receipt_total = parsed.get("receipt_total")
@@ -972,6 +974,7 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
     items_sum = round(sum(item["amount"] for item in items), 2)
     receipt_total = result.get("receipt_total") if isinstance(result, dict) else None
     suggested_total = receipt_total if receipt_total else items_sum
+    has_mismatch = receipt_total is not None and abs(items_sum - receipt_total) > 0.02
 
     context.user_data["mode"] = "receipt"
     context.user_data["receipt_items"] = items
@@ -985,9 +988,21 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         one_time_keyboard=True,
         resize_keyboard=True,
     )
+    if has_mismatch:
+        mismatch = abs(items_sum - receipt_total)
+        total_prompt = (
+            f"Found {len(items)} items. Items sum: <b>CHF {items_sum:.2f}</b> | "
+            f"Receipt total: <b>CHF {receipt_total:.2f}</b>\n"
+            f"⚠️ <b>CHF {mismatch:.2f}</b> mismatch — some item amounts may be off.\n"
+            "Tap to confirm or type the correct total:"
+        )
+    else:
+        total_prompt = (
+            f"Found {len(items)} items. Receipt total: <b>CHF {suggested_total:.2f}</b>\n"
+            "Tap to confirm or type the correct total:"
+        )
     await update.message.reply_text(
-        f"Found {len(items)} items. Receipt total: <b>CHF {suggested_total:.2f}</b>\n"
-        "Tap to confirm or type the correct total:",
+        total_prompt,
         parse_mode="HTML",
         reply_markup=total_kb,
     )
