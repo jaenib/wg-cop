@@ -69,9 +69,12 @@ TO_ID = getattr(_config, "TO_ID")
 JA_ID = getattr(_config, "JA_ID")
 UIDS = [NI_ID, GI_ID, GY_ID, TO_ID, JA_ID]
 OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", None)
+RECEIPT_LOCAL_OCR_ENABLED = str(
+    getattr(_config, "RECEIPT_LOCAL_OCR_ENABLED", "false")
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Data storage
-DATA_FILE = "wg_data_alpha.json"
+DATA_FILE = os.environ.get("WG_COP_DATA_FILE", "wg_data_alpha.json")
 
 
 def _get_chronicler_chat_id():
@@ -395,6 +398,7 @@ def get_admin_keyboard():
             [KeyboardButton("Trigger Weekly Report")],
             [KeyboardButton("Adjust Beer Count")],
             [KeyboardButton("Set WG-Höck")],
+            [KeyboardButton("System Overview")],
             [KeyboardButton("Back to Settings")],
         ],
         resize_keyboard=True,
@@ -473,6 +477,177 @@ async def back_to_settings(update: Update, context: CallbackContext) -> None:
         "Settings menu:",
         reply_markup=_settings_keyboard_for_user(update.effective_user),
     )
+
+
+def _secret_status(secret_value):
+    text = str(secret_value or "").strip()
+    if not text:
+        return "missing"
+    suffix = text[-4:] if len(text) >= 4 else text
+    return f"configured (len={len(text)}, endswith=...{suffix})"
+
+
+def _file_overview(path: str):
+    if not os.path.exists(path):
+        return "missing"
+
+    size = os.path.getsize(path)
+    tz = pytz.timezone("Europe/Berlin")
+    mtime = datetime.fromtimestamp(os.path.getmtime(path), tz).strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+    return f"present ({size} bytes, mtime {mtime})"
+
+
+def _job_next_run_text(job):
+    next_t = getattr(job, "next_t", None)
+    if next_t is None:
+        return "unknown"
+    if isinstance(next_t, datetime):
+        tz = pytz.timezone("Europe/Berlin")
+        if next_t.tzinfo is None:
+            next_t = tz.localize(next_t)
+        else:
+            next_t = next_t.astimezone(tz)
+        return next_t.strftime("%Y-%m-%d %H:%M:%S %Z")
+    return str(next_t)
+
+
+async def admin_system_overview(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    data = load_data()
+
+    members = data.get("members", []) or []
+    active_members = 0
+    vacating_members = 0
+    other_member_status = 0
+    for member in members:
+        status = _get_member_status(member)
+        if status == "active":
+            active_members += 1
+        elif status == "vacating":
+            vacating_members += 1
+        else:
+            other_member_status += 1
+
+    expenses = data.get("expenses", []) or []
+    expense_total = 0.0
+    receipt_expenses = 0
+    receipt_items_total = 0
+    for expense in expenses:
+        try:
+            expense_total += float(expense.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        items = expense.get("items")
+        if isinstance(items, list):
+            receipt_expenses += 1
+            receipt_items_total += len(items)
+
+    chores_totals = data.get("chores", {}) or {}
+    total_chore_points = 0
+    for points in chores_totals.values():
+        try:
+            total_chore_points += int(points)
+        except (TypeError, ValueError):
+            continue
+
+    penalties = data.get("penalties", {}) or {}
+    members_with_penalties = 0
+    beers_owed_total = 0
+    for owed_raw in penalties.values():
+        try:
+            owed = int(owed_raw)
+        except (TypeError, ValueError):
+            continue
+        if owed > 0:
+            members_with_penalties += 1
+            beers_owed_total += owed
+
+    weekly_meta = _get_weekly_report_meta(data)
+    chronicler_meta = _get_chronicler_meta(data)
+    data_file_path = str((ROOT / DATA_FILE).resolve())
+    persistence_path = str((ROOT / "bot_persistence.pkl").resolve())
+
+    user_content_keys = {
+        "members",
+        "expenses",
+        "chores",
+        "chore_log",
+        "penalties",
+        "last_week_violators",
+    }
+    non_user_keys = sorted(k for k in data.keys() if k not in user_content_keys)
+
+    scheduled_jobs = [
+        "weekly_penalty_check",
+        "weekly_report_catchup",
+        "chronicler_backup",
+        "chronicler_initial_backup",
+        "hoeck_reminder",
+        "heartbeat",
+    ]
+    job_lines = []
+    for job_name in scheduled_jobs:
+        jobs = context.application.job_queue.get_jobs_by_name(job_name)
+        if not jobs:
+            job_lines.append(f"  - {job_name}: not scheduled")
+            continue
+        next_run = _job_next_run_text(jobs[0])
+        job_lines.append(f"  - {job_name}: {len(jobs)} job(s), next={next_run}")
+
+    lines = [
+        "Admin System Overview (sanitized)",
+        "",
+        "Configured IDs:",
+        f"  - BOT_HANDLER_ID: {BOT_HANDLER_ID}",
+        f"  - GROUP_CHAT_ID (config): {GROUP_CHAT_ID}",
+        f"  - group_chat_id (data override): {data.get('group_chat_id')}",
+        f"  - effective weekly report chat: {data.get('group_chat_id') or GROUP_CHAT_ID}",
+        f"  - CHRONICLER_ID: {CHRONICLER_ID}",
+        f"  - NI_ID: {NI_ID}",
+        f"  - GI_ID: {GI_ID}",
+        f"  - GY_ID: {GY_ID}",
+        f"  - TO_ID: {TO_ID}",
+        f"  - JA_ID: {JA_ID}",
+        "",
+        "Runtime / Integrations:",
+        f"  - python: {sys.version.split()[0]}",
+        f"  - openai lib import: {bool(_openai_lib)}",
+        f"  - OPENAI_API_KEY: {_secret_status(OPENAI_API_KEY)}",
+        f"  - RECEIPT_LOCAL_OCR_ENABLED: {RECEIPT_LOCAL_OCR_ENABLED}",
+        f"  - PIL available: {Image is not None}",
+        f"  - tesseract in PATH: {shutil.which('tesseract') or 'not found'}",
+        "",
+        "Persistent Storage (no raw roommate content shown):",
+        f"  - data file: {data_file_path} -> {_file_overview(data_file_path)}",
+        f"  - persistence: {persistence_path} -> {_file_overview(persistence_path)}",
+        f"  - top-level keys: {', '.join(sorted(data.keys()))}",
+        f"  - non-user keys: {', '.join(non_user_keys) if non_user_keys else '(none)'}",
+        "",
+        "Dataset Counters (aggregated only):",
+        f"  - members: {len(members)} (active={active_members}, vacating={vacating_members}, other={other_member_status})",
+        f"  - expenses: {len(expenses)} entries, total={expense_total:.2f}, receipt_entries={receipt_expenses}, receipt_line_items={receipt_items_total}",
+        f"  - chore totals map: {len(chores_totals)} members, cumulative_points={total_chore_points}",
+        f"  - chore log entries: {len(data.get('chore_log', []) or [])}",
+        f"  - penalties: {members_with_penalties} owing member(s), beers_owed_total={beers_owed_total}",
+        f"  - last_week_violators tracked: {len(data.get('last_week_violators', {}) or {})}",
+        "",
+        "Scheduled Meta:",
+        f"  - weekly_report_time: {data.get('weekly_report_time', '09:30')} (Europe/Berlin)",
+        f"  - weekly_report_meta.last_sent: {weekly_meta.get('last_sent')}",
+        f"  - chronicler_backup.greeting_sent: {chronicler_meta.get('greeting_sent')}",
+        f"  - chronicler_backup.last_sent: {chronicler_meta.get('last_sent')}",
+        f"  - wg_hoeck_date: {data.get('wg_hoeck_date')}",
+        "",
+        "Scheduled Jobs:",
+        *job_lines,
+    ]
+
+    await update.message.reply_text("\n".join(lines), reply_markup=get_admin_keyboard())
 
 
 async def open_manage_self(update: Update, context: CallbackContext) -> None:
@@ -1045,7 +1220,8 @@ def _receipt_prompt_text(receipt_total=None, items_sum=None, prior_json=None):
         "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
         "- If the same product name appears on multiple lines (different weights), list EACH as a separate item; append weight to disambiguate\n"
         "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
-        "- Keep item names short but recognisable"
+        "- Keep item names short but recognisable\n"
+        "- Before returning, verify sum(amount) against receipt_total and fix obvious qty/amount mistakes (especially multi-buy lines)"
     )
     if receipt_total is not None and items_sum is not None and prior_json:
         prompt += (
@@ -1303,23 +1479,26 @@ def _merge_local_amounts_with_vision_names(local_items, vision_items, log_prefix
 def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     media_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
 
-    local_result = _extract_items_from_receipt_tesseract(image_path)
-    if local_result:
-        # Trust local amounts. Only clean names — text-only API first (cheap, no image tokens).
-        receipt_total = local_result.get("receipt_total")
-        cleaned_description, cleaned_names = _cleanup_names_via_text_api(
-            local_result["items"], receipt_total=receipt_total
-        )
-        if cleaned_names:
-            local_result["items"] = [
-                {**item, "name": cleaned_names[idx]}
-                for idx, item in enumerate(local_result["items"])
-            ]
-            if cleaned_description:
-                local_result["description"] = cleaned_description
-        return local_result
+    if RECEIPT_LOCAL_OCR_ENABLED:
+        local_result = _extract_items_from_receipt_tesseract(image_path)
+        if local_result:
+            # Trust local amounts. Only clean names — text-only API first (cheap, no image tokens).
+            receipt_total = local_result.get("receipt_total")
+            cleaned_description, cleaned_names = _cleanup_names_via_text_api(
+                local_result["items"], receipt_total=receipt_total
+            )
+            if cleaned_names:
+                local_result["items"] = [
+                    {**item, "name": cleaned_names[idx]}
+                    for idx, item in enumerate(local_result["items"])
+                ]
+                if cleaned_description:
+                    local_result["description"] = cleaned_description
+            return local_result
+    else:
+        logger.info("Local OCR disabled; using single-pass vision receipt extraction.")
 
-    # Local OCR found nothing — fall back to single-pass vision extraction.
+    # Use single-pass vision extraction (default path).
     if not _openai_lib or not OPENAI_API_KEY:
         raise ReceiptParsingError("Receipt scanning is not configured (missing OCR backend).")
 
@@ -3373,6 +3552,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
     app.add_handler(MessageHandler(filters.Regex("^Admin Panel$"), open_admin_menu))
     app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), back_to_settings))
+    app.add_handler(MessageHandler(filters.Regex("^System Overview$"), admin_system_overview))
     app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
     app.add_handler(MessageHandler(filters.Regex("^Manage "), open_manage_self))
 

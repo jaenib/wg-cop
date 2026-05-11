@@ -33,16 +33,7 @@ jobs:
             git fetch origin main
             git checkout -f main
             git reset --hard origin/main
-            git clean -fd
-
-            if ! command -v tesseract >/dev/null 2>&1; then
-              run_priv env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-              run_priv apt-get update
-              run_priv env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                tesseract-ocr \
-                tesseract-ocr-deu \
-                tesseract-ocr-eng
-            fi
+            git clean -fd -e 'wg_data_*.json*' -e 'bot_persistence.pkl'
 
             if [ ! -x ./venv/bin/python ]; then
               python3 -m venv venv
