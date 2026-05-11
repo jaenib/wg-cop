@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
 # =============================================================================
-# wg-cop — server reference for agents and humans
+# mario_robotta / wg-cop — server reference for agents and humans
 # =============================================================================
 #
-# DEPLOY METHOD: 100% GitHub Actions — do NOT manually push code to the server.
-#   Trigger: push to `main` branch → .github/workflows/deploy.yml fires.
-#   The workflow SSHes into the server and runs: git reset --hard origin/main,
-#   pip install, systemctl restart wg_cop.
+# PRIMARY DEPLOY METHOD: GitHub Actions (100% automated)
+#   Trigger : push to `main` branch
+#   Workflow : .github/workflows/deploy.yml
+#   What it does:
+#     ssh into server → git reset --hard origin/main → pip install → systemctl restart
+#   To deploy: merge your branch to main (PR or direct push to main).
+#   Do NOT scp code, do NOT git push to the server manually.
 #
-# To deploy: merge your branch to main (via PR or direct push).
-#
-# =============================================================================
-# SERVER ACCESS
-# =============================================================================
-#   Host : 82.165.45.100
-#   User : root
-#   SSH  : ssh root@82.165.45.100
-#   (Key must be configured in your local ~/.ssh or provided as SSH_KEY secret)
-#
-# =============================================================================
-# SERVER LAYOUT
-# =============================================================================
-#   /usr/bots/wg_cop/          — git repo (tracks origin/main)
-#   /usr/bots/wg_cop/venv/     — Python virtualenv
-#   /usr/bots/wg_cop/config.py — secrets (NOT in git, stays on server)
-#   /usr/bots/wg_cop/wg_data_alpha.json  — live database (NOT in git)
+# EMERGENCY FALLBACK (GitHub Actions broken):
+#   Use the parent deploy.sh, two directories above this file:
+#     ../../deploy.sh mario_robotta
+#   That script rsyncs from your local main to the server.
+#   Git remote alias for this repo on your Mac: jaenib-wgcop
 #
 # =============================================================================
-# USEFUL COMMANDS (run on the server via ssh)
+# SERVER
+# =============================================================================
+#   Host        : 82.165.45.100
+#   User        : root
+#   SSH         : ssh root@82.165.45.100
+#   Bot dir     : /usr/bots/wg_cop/
+#   Service     : wg_cop   (systemctl)
+#   Venv        : /usr/bots/wg_cop/venv/
+#
+# Files NOT in git (stay on server):
+#   config.py            — bot token + Telegram IDs (secrets)
+#   wg_data_alpha.json   — live expense/chore/penalty database
+#
+# =============================================================================
+# UTILITY COMMANDS
 # =============================================================================
 
 set -euo pipefail
@@ -36,42 +41,36 @@ SERVER="root@82.165.45.100"
 BOT_DIR="/usr/bots/wg_cop"
 SERVICE="wg_cop"
 
-cmd() { ssh "$SERVER" "$@"; }
-
 case "${1:-help}" in
 
   status)
-    # Show systemd service status and last 40 log lines
-    cmd "systemctl status $SERVICE --no-pager && journalctl -u $SERVICE -n 40 --no-pager"
+    ssh "$SERVER" "systemctl status $SERVICE --no-pager && journalctl -u $SERVICE -n 40 --no-pager"
     ;;
 
   logs)
-    # Stream live logs  (Ctrl-C to stop)
     ssh "$SERVER" "journalctl -u $SERVICE -f"
     ;;
 
   restart)
-    # Emergency restart without a full deploy (no code change)
-    echo "Restarting $SERVICE on $SERVER …"
-    cmd "systemctl restart $SERVICE"
-    cmd "systemctl status $SERVICE --no-pager"
+    echo "Restarting $SERVICE …"
+    ssh "$SERVER" "systemctl restart $SERVICE && systemctl status $SERVICE --no-pager"
     ;;
 
   data)
-    # Download the live database to /tmp/wg_data_live.json
+    # Download live database
     scp "$SERVER:$BOT_DIR/wg_data_alpha.json" /tmp/wg_data_live.json
     echo "Saved to /tmp/wg_data_live.json"
     ;;
 
   push-data)
-    # Upload a local JSON file to the server (emergency data restore)
-    # Usage: ./deploy.sh push-data /path/to/file.json
-    LOCAL="${2:?usage: deploy.sh push-data <local-file.json>}"
-    echo "Uploading $LOCAL → $SERVER:$BOT_DIR/wg_data_alpha.json"
-    echo "Press Ctrl-C within 5s to abort …"; sleep 5
+    # Emergency: upload a repaired database and restart
+    # Usage: ./deploy.sh push-data /path/to/wg_data_alpha.json
+    LOCAL="${2:?usage: deploy.sh push-data <file.json>}"
+    echo "Uploading $LOCAL → $SERVER:$BOT_DIR/wg_data_alpha.json (restarting in 5s…)"
+    sleep 5
     scp "$LOCAL" "$SERVER:$BOT_DIR/wg_data_alpha.json"
-    cmd "systemctl restart $SERVICE"
-    echo "Done. Service restarted."
+    ssh "$SERVER" "systemctl restart $SERVICE"
+    echo "Done."
     ;;
 
   help|*)
