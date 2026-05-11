@@ -703,7 +703,8 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
                             "Rules:\n"
                             "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
                             "- receipt_total: the grand total printed at the bottom (e.g. 'TOTAL CHF 129.50') — copy exactly as a number\n"
-                            "- qty: the Menge column value (can be fractional for weighted items, e.g. 0.275)\n"
+                            "- qty: MUST be the exact Menge column value from the receipt (can be fractional for weighted items, e.g. 0.275)\n"
+                            "- For multi-buy items, never default qty to 1: if the receipt shows 2 x CHF 2.00, return qty: 2, unit_price: 2.00, amount: 4.00\n"
                             "- unit_price: the Preis column value (unit price or per-kg price)\n"
                             "- amount: qty × unit_price — always compute this yourself for every item\n"
                             "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
@@ -723,7 +724,7 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
         start = raw.index("{")
         end = raw.rindex("}") + 1
         raw_json = raw[start:end]
-        logger.debug("Receipt OCR raw JSON: %s", raw_json)
+        logger.info("Receipt OCR raw JSON: %s", raw_json)
         parsed = json.loads(raw_json)
         items = parsed["items"]
         description = str(parsed.get("description", "")).strip()
@@ -741,22 +742,42 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
 
     try:
         normalised = []
-        for i in items:
+        for idx, i in enumerate(items, start=1):
             if not isinstance(i, dict) or "name" not in i or i.get("amount") is None:
                 continue
-            amount = round(float(i["amount"]), 2)
+            name = str(i["name"]).strip()
+            raw_qty = i.get("qty")
+            raw_unit_price = i.get("unit_price")
+            raw_amount = i.get("amount")
+            amount = round(float(raw_amount), 2)
+            qty = None
+            unit_price = None
+            computed = None
+            corrected = False
             # If GPT returned unit_price and qty, recompute for integer-qty > 1 items
             # (GPT often returns the Preis/unit column instead of the Total column for these)
             try:
-                qty = float(i.get("qty") or 1)
-                unit_price = float(i.get("unit_price") or 0)
+                qty = float(raw_qty or 1)
+                unit_price = float(raw_unit_price or 0)
                 if unit_price > 0 and qty == int(qty) and int(qty) > 1:
                     computed = round(qty * unit_price, 2)
                     if abs(computed - amount) > 0.005:
                         amount = computed
+                        corrected = True
             except (TypeError, ValueError):
                 pass
-            normalised.append({"name": str(i["name"]), "amount": amount})
+            logger.info(
+                "Receipt item %02d normalized: name=%r qty=%r unit_price=%r amount=%r computed=%r corrected=%s final=%.2f",
+                idx,
+                name,
+                raw_qty,
+                raw_unit_price,
+                raw_amount,
+                computed,
+                corrected,
+                amount,
+            )
+            normalised.append({"name": name, "amount": amount})
     except (TypeError, ValueError, KeyError) as exc:
         raise ReceiptParsingError(f"Failed to parse item data: {exc}") from exc
 
