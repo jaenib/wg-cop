@@ -670,6 +670,93 @@ def parse_receipt_text(text: str):
     return items
 
 
+def _receipt_prompt_text(receipt_total=None, items_sum=None, prior_json=None):
+    prompt = (
+        "Extract every purchased line item from this receipt and suggest a short expense description.\n"
+        "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
+        '{"description": "Migros groceries", "receipt_total": 129.50, "items": [{"name": "Product name", "qty": 1, "unit_price": 9.95, "amount": 9.95}, ...]}\n\n'
+        "Rules:\n"
+        "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
+        "- receipt_total: the grand total printed at the bottom (e.g. 'TOTAL CHF 129.50') — copy exactly as a number\n"
+        "- qty: MUST be the exact Menge column value from the receipt (can be fractional for weighted items, e.g. 0.275)\n"
+        "- For multi-buy items, never default qty to 1: if the receipt shows 2 x CHF 2.00, return qty: 2, unit_price: 2.00, amount: 4.00\n"
+        "- unit_price: the Preis column value (unit price or per-kg price)\n"
+        "- amount: qty × unit_price — always compute this yourself for every item\n"
+        "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
+        "- If the same product name appears on multiple lines (different weights), list EACH as a separate item; append weight to disambiguate\n"
+        "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
+        "- Keep item names short but recognisable"
+    )
+    if receipt_total is not None and items_sum is not None and prior_json:
+        prompt += (
+            "\n\nRe-check carefully because the first extraction does not reconcile.\n"
+            f"- Printed receipt total: CHF {receipt_total:.2f}\n"
+            f"- Current sum of item amounts: CHF {items_sum:.2f}\n"
+            f"- First extracted JSON: {prior_json}\n"
+            "- Focus on missed duplicate lines and wrong qty values on multi-buy items.\n"
+            "- If a line shows multiple units of the same item, return the correct qty instead of 1.\n"
+            "- Return a corrected full JSON object for the entire receipt, not a diff."
+        )
+    return prompt
+
+
+def _parse_receipt_ocr_response(raw: str, log_prefix: str):
+    start = raw.index("{")
+    end = raw.rindex("}") + 1
+    raw_json = raw[start:end]
+    logger.info("%s raw JSON: %s", log_prefix, raw_json)
+    parsed = json.loads(raw_json)
+    items = parsed["items"]
+    description = str(parsed.get("description", "")).strip()
+    receipt_total = parsed.get("receipt_total")
+    if receipt_total is not None:
+        try:
+            receipt_total = round(float(receipt_total), 2)
+        except (TypeError, ValueError):
+            receipt_total = None
+    return raw_json, items, description, receipt_total
+
+
+def _normalise_receipt_items(items, log_prefix: str):
+    normalised = []
+    for idx, i in enumerate(items, start=1):
+        if not isinstance(i, dict) or "name" not in i or i.get("amount") is None:
+            continue
+        name = str(i["name"]).strip()
+        raw_qty = i.get("qty")
+        raw_unit_price = i.get("unit_price")
+        raw_amount = i.get("amount")
+        amount = round(float(raw_amount), 2)
+        qty = None
+        unit_price = None
+        computed = None
+        corrected = False
+        try:
+            qty = float(raw_qty or 1)
+            unit_price = float(raw_unit_price or 0)
+            if unit_price > 0 and qty == int(qty) and int(qty) > 1:
+                computed = round(qty * unit_price, 2)
+                if abs(computed - amount) > 0.005:
+                    amount = computed
+                    corrected = True
+        except (TypeError, ValueError):
+            pass
+        logger.info(
+            "%s item %02d normalized: name=%r qty=%r unit_price=%r amount=%r computed=%r corrected=%s final=%.2f",
+            log_prefix,
+            idx,
+            name,
+            raw_qty,
+            raw_unit_price,
+            raw_amount,
+            computed,
+            corrected,
+            amount,
+        )
+        normalised.append({"name": name, "amount": amount})
+    return normalised
+
+
 def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     if not _openai_lib or not OPENAI_API_KEY:
         raise ReceiptParsingError("Receipt scanning is not configured (missing OPENAI_API_KEY).")
@@ -683,10 +770,10 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     media_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
 
     client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
-    try:
-        response = client.chat.completions.create(
+    def run_vision_pass(prompt_text: str):
+        return client.chat.completions.create(
             model="gpt-4o-mini",
-            max_tokens=1024,
+            max_tokens=1536,
             messages=[{
                 "role": "user",
                 "content": [
@@ -696,44 +783,22 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
                     },
                     {
                         "type": "text",
-                        "text": (
-                            "Extract every purchased line item from this receipt and suggest a short expense description.\n"
-                            "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
-                            '{"description": "Migros groceries", "receipt_total": 129.50, "items": [{"name": "Product name", "qty": 1, "unit_price": 9.95, "amount": 9.95}, ...]}\n\n'
-                            "Rules:\n"
-                            "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
-                            "- receipt_total: the grand total printed at the bottom (e.g. 'TOTAL CHF 129.50') — copy exactly as a number\n"
-                            "- qty: MUST be the exact Menge column value from the receipt (can be fractional for weighted items, e.g. 0.275)\n"
-                            "- For multi-buy items, never default qty to 1: if the receipt shows 2 x CHF 2.00, return qty: 2, unit_price: 2.00, amount: 4.00\n"
-                            "- unit_price: the Preis column value (unit price or per-kg price)\n"
-                            "- amount: qty × unit_price — always compute this yourself for every item\n"
-                            "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
-                            "- If the same product name appears on multiple lines (different weights), list EACH as a separate item; append weight to disambiguate\n"
-                            "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
-                            "- Keep item names short but recognisable"
-                        ),
+                        "text": prompt_text,
                     },
                 ],
-            }],
+            }]
         )
+
+    try:
+        first_response = run_vision_pass(_receipt_prompt_text())
     except Exception as exc:
         raise ReceiptParsingError(f"Vision API error: {exc}") from exc
 
-    raw = response.choices[0].message.content.strip()
+    raw = first_response.choices[0].message.content.strip()
     try:
-        start = raw.index("{")
-        end = raw.rindex("}") + 1
-        raw_json = raw[start:end]
-        logger.info("Receipt OCR raw JSON: %s", raw_json)
-        parsed = json.loads(raw_json)
-        items = parsed["items"]
-        description = str(parsed.get("description", "")).strip()
-        receipt_total = parsed.get("receipt_total")
-        if receipt_total is not None:
-            try:
-                receipt_total = round(float(receipt_total), 2)
-            except (TypeError, ValueError):
-                receipt_total = None
+        raw_json, items, description, receipt_total = _parse_receipt_ocr_response(
+            raw, "Receipt OCR pass1"
+        )
     except (ValueError, json.JSONDecodeError, KeyError) as exc:
         raise ReceiptParsingError(f"Could not parse API response as JSON: {exc}") from exc
 
@@ -741,48 +806,56 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
         raise ReceiptParsingError("No line items found in receipt.")
 
     try:
-        normalised = []
-        for idx, i in enumerate(items, start=1):
-            if not isinstance(i, dict) or "name" not in i or i.get("amount") is None:
-                continue
-            name = str(i["name"]).strip()
-            raw_qty = i.get("qty")
-            raw_unit_price = i.get("unit_price")
-            raw_amount = i.get("amount")
-            amount = round(float(raw_amount), 2)
-            qty = None
-            unit_price = None
-            computed = None
-            corrected = False
-            # If GPT returned unit_price and qty, recompute for integer-qty > 1 items
-            # (GPT often returns the Preis/unit column instead of the Total column for these)
-            try:
-                qty = float(raw_qty or 1)
-                unit_price = float(raw_unit_price or 0)
-                if unit_price > 0 and qty == int(qty) and int(qty) > 1:
-                    computed = round(qty * unit_price, 2)
-                    if abs(computed - amount) > 0.005:
-                        amount = computed
-                        corrected = True
-            except (TypeError, ValueError):
-                pass
-            logger.info(
-                "Receipt item %02d normalized: name=%r qty=%r unit_price=%r amount=%r computed=%r corrected=%s final=%.2f",
-                idx,
-                name,
-                raw_qty,
-                raw_unit_price,
-                raw_amount,
-                computed,
-                corrected,
-                amount,
-            )
-            normalised.append({"name": name, "amount": amount})
+        normalised = _normalise_receipt_items(items, "Receipt OCR pass1")
     except (TypeError, ValueError, KeyError) as exc:
         raise ReceiptParsingError(f"Failed to parse item data: {exc}") from exc
 
     if not normalised:
         raise ReceiptParsingError("No valid line items found in receipt.")
+
+    items_sum = round(sum(item["amount"] for item in normalised), 2)
+    needs_reconcile = receipt_total is not None and abs(items_sum - receipt_total) > 0.02
+    if needs_reconcile:
+        logger.info(
+            "Receipt OCR pass1 mismatch: items_sum=%.2f receipt_total=%.2f, running reconciliation pass",
+            items_sum,
+            receipt_total,
+        )
+        try:
+            second_response = run_vision_pass(
+                _receipt_prompt_text(
+                    receipt_total=receipt_total,
+                    items_sum=items_sum,
+                    prior_json=raw_json,
+                )
+            )
+            raw2 = second_response.choices[0].message.content.strip()
+            raw_json2, items2, description2, receipt_total2 = _parse_receipt_ocr_response(
+                raw2, "Receipt OCR pass2"
+            )
+            normalised2 = _normalise_receipt_items(items2, "Receipt OCR pass2")
+            if normalised2:
+                items_sum2 = round(sum(item["amount"] for item in normalised2), 2)
+                chosen_receipt_total = (
+                    receipt_total2 if receipt_total2 is not None else receipt_total
+                )
+                logger.info(
+                    "Receipt OCR pass2 result: items_sum=%.2f receipt_total=%s",
+                    items_sum2,
+                    f"{chosen_receipt_total:.2f}" if chosen_receipt_total is not None else "None",
+                )
+                if chosen_receipt_total is not None and (
+                    abs(items_sum2 - chosen_receipt_total) < abs(items_sum - receipt_total)
+                ):
+                    logger.info("Receipt OCR pass2 accepted over pass1")
+                    normalised = normalised2
+                    description = description2 or description
+                    receipt_total = chosen_receipt_total
+                    raw_json = raw_json2
+                else:
+                    logger.info("Receipt OCR pass2 did not improve reconciliation; keeping pass1")
+        except Exception as exc:
+            logger.warning("Receipt OCR pass2 failed: %s", exc)
 
     return {
         "description": description,
