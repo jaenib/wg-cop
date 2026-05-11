@@ -1,4 +1,5 @@
 import json
+import base64
 import logging
 import copy
 from random import random
@@ -24,14 +25,9 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 try:
-    from PIL import Image
+    import anthropic as _anthropic_lib
 except ImportError:  # pragma: no cover - optional dependency
-    Image = None
-
-try:
-    import pytesseract
-except ImportError:  # pragma: no cover - optional dependency
-    pytesseract = None
+    _anthropic_lib = None
 
 # Set up logging
 logging.basicConfig(
@@ -66,6 +62,7 @@ GY_ID = getattr(_config, "GY_ID")
 TO_ID = getattr(_config, "TO_ID")
 JA_ID = getattr(_config, "JA_ID")
 UIDS = [NI_ID, GI_ID, GY_ID, TO_ID, JA_ID]
+ANTHROPIC_API_KEY = getattr(_config, "ANTHROPIC_API_KEY", None)
 
 # Data storage
 DATA_FILE = "wg_data_alpha.json"
@@ -660,18 +657,61 @@ def parse_receipt_text(text: str):
 
 
 def extract_items_from_receipt(image_path: str):
-    if not pytesseract or not Image:
-        raise ReceiptParsingError("OCR dependencies are not installed.")
+    if not _anthropic_lib or not ANTHROPIC_API_KEY:
+        raise ReceiptParsingError("Receipt scanning is not configured (missing ANTHROPIC_API_KEY).")
+
     try:
-        with Image.open(image_path) as img:
-            text = pytesseract.image_to_string(img)
-    except Exception as exc:  # pragma: no cover - depends on runtime env
+        with open(image_path, "rb") as f:
+            image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    except Exception as exc:
         raise ReceiptParsingError("Failed to read the receipt image.") from exc
 
-    items = parse_receipt_text(text)
+    ext = image_path.rsplit(".", 1)[-1].lower()
+    media_type = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+
+    client = _anthropic_lib.Anthropic(api_key=ANTHROPIC_API_KEY)
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": image_data},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract every purchased line item from this receipt.\n"
+                            "Return ONLY a JSON array — no markdown, no explanation — in this format:\n"
+                            '[{"name": "Product name", "amount": 9.95}, ...]\n\n'
+                            "Rules:\n"
+                            "- Use the final price paid per item (after discounts, before total)\n"
+                            "- For weighted items (e.g. 0.275 kg × price/kg) use the computed subtotal\n"
+                            "- Exclude header rows, subtotals, totals, tax lines, and loyalty points\n"
+                            "- Keep names short but recognisable"
+                        ),
+                    },
+                ],
+            }],
+        )
+    except Exception as exc:
+        raise ReceiptParsingError(f"Vision API error: {exc}") from exc
+
+    raw = message.content[0].text.strip()
+    try:
+        start = raw.index("[")
+        end = raw.rindex("]") + 1
+        items = json.loads(raw[start:end])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ReceiptParsingError(f"Could not parse API response as JSON: {exc}") from exc
+
     if not items:
-        raise ReceiptParsingError("No line items recognised in the receipt.")
-    return items
+        raise ReceiptParsingError("No line items found in receipt.")
+
+    return [{"name": str(i["name"]), "amount": round(float(i["amount"]), 2)} for i in items]
 
 
 # Start
@@ -755,7 +795,7 @@ async def start_expense(update: Update, context: CallbackContext) -> int:
     keyboard = ReplyKeyboardMarkup(
         [
             [KeyboardButton("Manual Entry")],
-            [KeyboardButton("Scan Receipt (Coming Soon)")],
+            [KeyboardButton("Scan Receipt")],
             [KeyboardButton("Cancel")],
         ],
         resize_keyboard=True,
@@ -781,19 +821,12 @@ async def expense_mode_selection(update: Update, context: CallbackContext) -> in
         return EXPENSE_DESCRIPTION
 
     if lowered.startswith("scan receipt"):
-        context.user_data["mode"] = "manual"
-        comic = randint(1, 3163)
-        link = f"https://xkcd.com/{comic}/"
+        context.user_data["mode"] = "receipt"
         await update.message.reply_text(
-            f"Receipt scanning is coming soon. Here's an xkcd to enjoy meanwhile: {link}",
+            "Send a photo of the receipt:",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
         )
-        '''
-        await update.message.reply_text(
-            "Enter a short description for the expense (e.g., 'Groceries Migros'):",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        '''
-        return EXPENSE_MODE
+        return EXPENSE_RECEIPT
 
     if lowered == "cancel":
         return await cancel(update, context)
