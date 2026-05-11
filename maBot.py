@@ -69,6 +69,9 @@ TO_ID = getattr(_config, "TO_ID")
 JA_ID = getattr(_config, "JA_ID")
 UIDS = [NI_ID, GI_ID, GY_ID, TO_ID, JA_ID]
 OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", None)
+RECEIPT_LOCAL_OCR_ENABLED = str(
+    getattr(_config, "RECEIPT_LOCAL_OCR_ENABLED", "false")
+).strip().lower() in ("1", "true", "yes", "on")
 
 # Data storage
 DATA_FILE = "wg_data_alpha.json"
@@ -1045,7 +1048,8 @@ def _receipt_prompt_text(receipt_total=None, items_sum=None, prior_json=None):
         "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
         "- If the same product name appears on multiple lines (different weights), list EACH as a separate item; append weight to disambiguate\n"
         "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
-        "- Keep item names short but recognisable"
+        "- Keep item names short but recognisable\n"
+        "- Before returning, verify sum(amount) against receipt_total and fix obvious qty/amount mistakes (especially multi-buy lines)"
     )
     if receipt_total is not None and items_sum is not None and prior_json:
         prompt += (
@@ -1303,23 +1307,26 @@ def _merge_local_amounts_with_vision_names(local_items, vision_items, log_prefix
 def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     media_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
 
-    local_result = _extract_items_from_receipt_tesseract(image_path)
-    if local_result:
-        # Trust local amounts. Only clean names — text-only API first (cheap, no image tokens).
-        receipt_total = local_result.get("receipt_total")
-        cleaned_description, cleaned_names = _cleanup_names_via_text_api(
-            local_result["items"], receipt_total=receipt_total
-        )
-        if cleaned_names:
-            local_result["items"] = [
-                {**item, "name": cleaned_names[idx]}
-                for idx, item in enumerate(local_result["items"])
-            ]
-            if cleaned_description:
-                local_result["description"] = cleaned_description
-        return local_result
+    if RECEIPT_LOCAL_OCR_ENABLED:
+        local_result = _extract_items_from_receipt_tesseract(image_path)
+        if local_result:
+            # Trust local amounts. Only clean names — text-only API first (cheap, no image tokens).
+            receipt_total = local_result.get("receipt_total")
+            cleaned_description, cleaned_names = _cleanup_names_via_text_api(
+                local_result["items"], receipt_total=receipt_total
+            )
+            if cleaned_names:
+                local_result["items"] = [
+                    {**item, "name": cleaned_names[idx]}
+                    for idx, item in enumerate(local_result["items"])
+                ]
+                if cleaned_description:
+                    local_result["description"] = cleaned_description
+            return local_result
+    else:
+        logger.info("Local OCR disabled; using single-pass vision receipt extraction.")
 
-    # Local OCR found nothing — fall back to single-pass vision extraction.
+    # Use single-pass vision extraction (default path).
     if not _openai_lib or not OPENAI_API_KEY:
         raise ReceiptParsingError("Receipt scanning is not configured (missing OCR backend).")
 
