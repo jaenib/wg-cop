@@ -8,6 +8,7 @@ import sys, os
 import re
 import tempfile
 import html
+import subprocess
 import pytz
 import shutil, time
 from pathlib import Path
@@ -576,6 +577,7 @@ _COLUMN_TOKEN_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 _HEADER_MARKERS = re.compile(r"\bartikel\b", re.IGNORECASE)
 _STOP_MARKERS = re.compile(r"\b(total|summe|gesamt)\b", re.IGNORECASE)
 _COLUMN_WORDS = {"aktion", "ak", "chf"}
+_TOTAL_LINE_RE = re.compile(r"\b(total|summe|gesamt)\b.*?(-?\d+[.,]\d{1,2})", re.IGNORECASE)
 
 
 def _looks_like_column_token(token: str) -> bool:
@@ -670,6 +672,81 @@ def parse_receipt_text(text: str):
     return items
 
 
+def _infer_receipt_description(text: str) -> str:
+    lower = text.lower()
+    if "migros" in lower:
+        return "Migros groceries"
+    if "coop" in lower:
+        return "Coop groceries"
+    if "lidl" in lower:
+        return "Lidl groceries"
+    if "aldi" in lower:
+        return "Aldi groceries"
+    return "Receipt groceries"
+
+
+def _extract_receipt_total_from_text(text: str):
+    matches = []
+    for line in text.splitlines():
+        clean = _normalise_receipt_line(line)
+        if not clean:
+            continue
+        match = _TOTAL_LINE_RE.search(clean)
+        if not match:
+            continue
+        try:
+            amount = round(float(match.group(2).replace(",", ".")), 2)
+        except ValueError:
+            continue
+        matches.append(amount)
+    return matches[-1] if matches else None
+
+
+def _extract_items_from_receipt_tesseract(image_path: str):
+    tesseract = shutil.which("tesseract")
+    if not tesseract:
+        return None
+
+    psm_modes = ("6", "4")
+    for psm in psm_modes:
+        try:
+            proc = subprocess.run(
+                [tesseract, image_path, "stdout", "-l", "deu+eng", "--psm", psm],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            logger.warning("Local OCR failed to start: %s", exc)
+            return None
+
+        if proc.returncode != 0:
+            logger.warning("Local OCR failed (psm=%s): %s", psm, proc.stderr.strip())
+            continue
+
+        ocr_text = proc.stdout or ""
+        logger.info("Local OCR text (psm=%s): %s", psm, ocr_text)
+        items = parse_receipt_text(ocr_text)
+        if not items:
+            continue
+
+        receipt_total = _extract_receipt_total_from_text(ocr_text)
+        logger.info(
+            "Local OCR parsed %d items (psm=%s), items_sum=%.2f, receipt_total=%s",
+            len(items),
+            psm,
+            round(sum(item["amount"] for item in items), 2),
+            f"{receipt_total:.2f}" if receipt_total is not None else "None",
+        )
+        return {
+            "description": _infer_receipt_description(ocr_text),
+            "receipt_total": receipt_total,
+            "items": items,
+        }
+
+    return None
+
+
 def _receipt_prompt_text(receipt_total=None, items_sum=None, prior_json=None):
     prompt = (
         "Extract every purchased line item from this receipt and suggest a short expense description.\n"
@@ -758,8 +835,12 @@ def _normalise_receipt_items(items, log_prefix: str):
 
 
 def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
+    local_result = _extract_items_from_receipt_tesseract(image_path)
+    if local_result:
+        return local_result
+
     if not _openai_lib or not OPENAI_API_KEY:
-        raise ReceiptParsingError("Receipt scanning is not configured (missing OPENAI_API_KEY).")
+        raise ReceiptParsingError("Receipt scanning is not configured (missing OCR backend).")
 
     try:
         with open(image_path, "rb") as f:
