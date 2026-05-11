@@ -698,14 +698,15 @@ def extract_items_from_receipt(image_path: str):
                     {
                         "type": "text",
                         "text": (
-                            "Extract every purchased line item from this receipt.\n"
-                            "Return ONLY a JSON array — no markdown, no explanation — in this format:\n"
-                            '[{"name": "Product name", "amount": 9.95}, ...]\n\n'
+                            "Extract every purchased line item from this receipt and suggest a short expense description.\n"
+                            "Return ONLY a JSON object — no markdown, no explanation — in this format:\n"
+                            '{"description": "Migros groceries", "items": [{"name": "Product name", "amount": 9.95}, ...]}\n\n'
                             "Rules:\n"
+                            "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
                             "- Use the final price paid per item (after discounts, before total)\n"
                             "- For weighted items (e.g. 0.275 kg × price/kg) use the computed subtotal\n"
                             "- Exclude header rows, subtotals, totals, tax lines, and loyalty points\n"
-                            "- Keep names short but recognisable"
+                            "- Keep item names short but recognisable"
                         ),
                     },
                 ],
@@ -716,16 +717,21 @@ def extract_items_from_receipt(image_path: str):
 
     raw = response.choices[0].message.content.strip()
     try:
-        start = raw.index("[")
-        end = raw.rindex("]") + 1
-        items = json.loads(raw[start:end])
-    except (ValueError, json.JSONDecodeError) as exc:
+        start = raw.index("{")
+        end = raw.rindex("}") + 1
+        parsed = json.loads(raw[start:end])
+        items = parsed["items"]
+        description = str(parsed.get("description", "")).strip()
+    except (ValueError, json.JSONDecodeError, KeyError) as exc:
         raise ReceiptParsingError(f"Could not parse API response as JSON: {exc}") from exc
 
     if not items:
         raise ReceiptParsingError("No line items found in receipt.")
 
-    return [{"name": str(i["name"]), "amount": round(float(i["amount"]), 2)} for i in items]
+    return {
+        "description": description,
+        "items": [{"name": str(i["name"]), "amount": round(float(i["amount"]), 2)} for i in items],
+    }
 
 
 # Start
@@ -901,7 +907,7 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         await telegram_file.download_to_drive(tmp_path)
 
         try:
-            items = extract_items_from_receipt(tmp_path)
+            result = extract_items_from_receipt(tmp_path)
         except ReceiptParsingError as exc:
             logger.info("Receipt OCR failed: %s", exc)
             await update.message.reply_text(
@@ -915,6 +921,7 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+    items = result.get("items", []) if isinstance(result, dict) else result
     if not items:
         await update.message.reply_text(
             "I couldn't find any purchasable items. Please send them as text, one per line."
@@ -923,6 +930,8 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
 
     context.user_data["mode"] = "receipt"
     context.user_data["receipt_items"] = items
+    if isinstance(result, dict) and result.get("description"):
+        context.user_data["receipt_description"] = result["description"]
     context.user_data["receipt_selected"] = set(range(len(items)))
 
     await update.message.reply_text(
@@ -1003,10 +1012,24 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
         lines.append(f"Shared subtotal: {total:.2f}")
 
         await query.edit_message_text("\n".join(lines))
-        await query.message.reply_text(
-            "Enter a short description for these items:",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+
+        auto_desc = context.user_data.get("receipt_description", "")
+        if auto_desc:
+            desc_kb = ReplyKeyboardMarkup(
+                [[auto_desc]],
+                one_time_keyboard=True,
+                resize_keyboard=True,
+            )
+            await query.message.reply_text(
+                f"Suggested description: <b>{html.escape(auto_desc)}</b>\nTap to use it or type your own:",
+                parse_mode="HTML",
+                reply_markup=desc_kb,
+            )
+        else:
+            await query.message.reply_text(
+                "Enter a short description for these items:",
+                reply_markup=ReplyKeyboardRemove(),
+            )
         return EXPENSE_DESCRIPTION
 
     if query.data.startswith(CB_RECEIPT_TOGGLE_PREFIX):
@@ -1402,15 +1425,6 @@ def _format_expense_entry(entry, viewer_name):
             if share_count:
                 share = amount / share_count
                 lines.append(f"Your share: {_format_currency(share)}")
-
-    items = entry.get("items") or []
-    if items:
-        item_lines = []
-        for item in items:
-            name = html.escape(str(item.get("name", "Item")))
-            item_amount = float(item.get("amount", 0.0) or 0.0)
-            item_lines.append(f"{name} ({_format_currency(item_amount)})")
-        lines.append("Items: " + ", ".join(item_lines))
 
     return "\n".join(lines)
 
