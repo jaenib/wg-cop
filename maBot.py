@@ -699,17 +699,17 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
                         "text": (
                             "Extract every purchased line item from this receipt and suggest a short expense description.\n"
                             "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
-                            '{"description": "Migros groceries", "receipt_total": 129.50, "items": [{"name": "Product name", "amount": 9.95}, ...]}\n\n'
+                            '{"description": "Migros groceries", "receipt_total": 129.50, "items": [{"name": "Product name", "qty": 1, "unit_price": 9.95, "amount": 9.95}, ...]}\n\n'
                             "Rules:\n"
                             "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
-                            "- receipt_total: read the grand total printed at the bottom of the receipt (e.g. 'TOTAL CHF 129.50') — copy it exactly as a number\n"
-                            "- For each item use the TOTAL column (the rightmost price on the line) as the amount — never multiply Menge × Preis yourself\n"
-                            "- For weighted items (e.g. 0.275 kg) the Total column already shows the CHF amount charged; use it as-is\n"
-                            "- For discounted items use the discounted/action price shown in the Total column, not the original price\n"
-                            "- For multi-quantity items (e.g. Menge=2) the Total column already reflects the full line total; use it\n"
-                            "- If the same product name appears on multiple lines (e.g. Bauernspeck twice with different weights), list EACH line as a separate item — do not merge them\n"
+                            "- receipt_total: the grand total printed at the bottom (e.g. 'TOTAL CHF 129.50') — copy exactly as a number\n"
+                            "- qty: the Menge column value (can be fractional for weighted items, e.g. 0.275)\n"
+                            "- unit_price: the Preis column value (unit price or per-kg price)\n"
+                            "- amount: qty × unit_price — always compute this yourself for every item\n"
+                            "- For discounted items: unit_price and amount should reflect the discounted price (Aktion column), not the original\n"
+                            "- If the same product name appears on multiple lines (different weights), list EACH as a separate item; append weight to disambiguate\n"
                             "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
-                            "- Keep item names short but recognisable; append weight (e.g. '0.128kg') to disambiguate duplicate names"
+                            "- Keep item names short but recognisable"
                         ),
                     },
                 ],
@@ -742,7 +742,19 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
         for i in items:
             if not isinstance(i, dict) or "name" not in i or i.get("amount") is None:
                 continue
-            normalised.append({"name": str(i["name"]), "amount": round(float(i["amount"]), 2)})
+            amount = round(float(i["amount"]), 2)
+            # If GPT returned unit_price and qty, recompute for integer-qty > 1 items
+            # (GPT often returns the Preis/unit column instead of the Total column for these)
+            try:
+                qty = float(i.get("qty") or 1)
+                unit_price = float(i.get("unit_price") or 0)
+                if unit_price > 0 and qty == int(qty) and int(qty) > 1:
+                    computed = round(qty * unit_price, 2)
+                    if abs(computed - amount) > 0.005:
+                        amount = computed
+            except (TypeError, ValueError):
+                pass
+            normalised.append({"name": str(i["name"]), "amount": amount})
     except (TypeError, ValueError, KeyError) as exc:
         raise ReceiptParsingError(f"Failed to parse item data: {exc}") from exc
 
