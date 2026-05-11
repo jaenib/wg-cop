@@ -3537,7 +3537,6 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("expenses", list_expenses))
-    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("chore", handle_chore))
     app.add_handler(CommandHandler("chores", list_chores))
     app.add_handler(CommandHandler("setstatus", set_vacation_status))
@@ -3556,15 +3555,16 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^System Overview$"), admin_system_overview))
     app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
     app.add_handler(MessageHandler(filters.Regex("^Manage "), open_manage_self))
-    app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     admin_beer_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Adjust Beer Count$"), admin_beer_start)],
         states={
             ADMIN_BEER_MEMBER: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_member)
             ],
             ADMIN_BEER_COUNT: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_count)
             ],
             ConversationHandler.TIMEOUT: [
@@ -3583,7 +3583,10 @@ def main():
     admin_hoeck_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^Set WG-Höck$"), admin_hoeck_start)],
         states={
-            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_hoeck_date)],
+            0: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_hoeck_date),
+            ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
             ],
@@ -3600,7 +3603,10 @@ def main():
     admin_report_time_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Set Report Time$"), admin_report_time_start)],
         states={
-            ADMIN_REPORT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_report_time_set)],
+            ADMIN_REPORT_TIME: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_report_time_set),
+            ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
             ],
@@ -3635,6 +3641,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_confirm_total),
             ],
             EXPENSE_RECEIPT_MANUAL: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, expense_receipt_manual_items
                 )
@@ -3741,10 +3748,12 @@ def main():
         states={
             REDEEM_MEMBER: [
                 MessageHandler(_nav_pattern, cancel),
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_member),
             ],
             REDEEM_COUNT: [
                 MessageHandler(_nav_pattern, cancel),
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_count),
             ],
             ConversationHandler.TIMEOUT: [
@@ -3801,6 +3810,13 @@ def main():
             pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel)$",
         )
     )
+
+    # Top-level cancel — registered LAST so each ConversationHandler's own
+    # fallback gets first shot at /cancel and can properly end the conversation.
+    # If we registered these earlier, they would swallow /cancel before the
+    # ConversationHandler ever sees it, leaving the user stuck in their state.
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     _startup_data = load_data()
     _rh, _rm = _parse_report_time(_startup_data.get("weekly_report_time", "09:30"))
