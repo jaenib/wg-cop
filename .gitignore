@@ -11,4 +11,5 @@ __pycache__/
 .env
 config.py
 .venv/
+venv/
 .secrets
