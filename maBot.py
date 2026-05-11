@@ -703,9 +703,11 @@ def extract_items_from_receipt(image_path: str):
                             '{"description": "Migros groceries", "items": [{"name": "Product name", "amount": 9.95}, ...]}\n\n'
                             "Rules:\n"
                             "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
-                            "- Use the final price paid per item (after discounts, before total)\n"
-                            "- For weighted items (e.g. 0.275 kg × price/kg) use the computed subtotal\n"
-                            "- Exclude header rows, subtotals, totals, tax lines, and loyalty points\n"
+                            "- For each item use the TOTAL column (the rightmost price on the line) as the amount — never multiply Menge × Preis yourself\n"
+                            "- For weighted items (e.g. 0.275 kg) the Total column already shows the CHF amount charged; use it as-is\n"
+                            "- For discounted items use the discounted/action price shown in the Total column, not the original price\n"
+                            "- For multi-quantity items (e.g. Menge=2) the Total column already reflects the full line total; use it\n"
+                            "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
                             "- Keep item names short but recognisable"
                         ),
                     },
@@ -883,6 +885,24 @@ async def expense_amount(update: Update, context: CallbackContext) -> int:
         return EXPENSE_AMOUNT
 
     context.user_data.setdefault("mode", "manual")
+    if context.user_data.get("mode") == "receipt":
+        auto_desc = context.user_data.get("receipt_description", "")
+        if auto_desc:
+            desc_kb = ReplyKeyboardMarkup(
+                [[auto_desc]],
+                one_time_keyboard=True,
+                resize_keyboard=True,
+            )
+            await update.message.reply_text(
+                f"Suggested description: <b>{html.escape(auto_desc)}</b>\nTap to use it or type your own:",
+                parse_mode="HTML",
+                reply_markup=desc_kb,
+            )
+        else:
+            await update.message.reply_text(
+                "Enter a short description:", reply_markup=ReplyKeyboardRemove()
+            )
+        return EXPENSE_DESCRIPTION
     return await _prompt_for_payer(update.message, context)
 
 
@@ -1003,34 +1023,24 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
         chosen = [items[i] for i in sorted(selected)]
         total = round(sum(item["amount"] for item in chosen), 2)
         context.user_data["selected_items"] = chosen
-        context.user_data["amount"] = total
 
         lines = ["Selected items:"]
         for item in chosen:
             lines.append(f"• {item['name']} — {item['amount']:.2f}")
-        lines.append("")
-        lines.append(f"Shared subtotal: {total:.2f}")
 
         await query.edit_message_text("\n".join(lines))
 
-        auto_desc = context.user_data.get("receipt_description", "")
-        if auto_desc:
-            desc_kb = ReplyKeyboardMarkup(
-                [[auto_desc]],
-                one_time_keyboard=True,
-                resize_keyboard=True,
-            )
-            await query.message.reply_text(
-                f"Suggested description: <b>{html.escape(auto_desc)}</b>\nTap to use it or type your own:",
-                parse_mode="HTML",
-                reply_markup=desc_kb,
-            )
-        else:
-            await query.message.reply_text(
-                "Enter a short description for these items:",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        return EXPENSE_DESCRIPTION
+        amount_kb = ReplyKeyboardMarkup(
+            [[f"{total:.2f}"]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+        await query.message.reply_text(
+            f"Parsed subtotal: <b>CHF {total:.2f}</b>\nConfirm or enter the correct receipt total:",
+            parse_mode="HTML",
+            reply_markup=amount_kb,
+        )
+        return EXPENSE_AMOUNT
 
     if query.data.startswith(CB_RECEIPT_TOGGLE_PREFIX):
         try:
