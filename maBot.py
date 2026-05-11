@@ -2831,6 +2831,23 @@ def main():
 
     app.add_handler(chore_conv)
 
+    # Catch stale receipt inline-keyboard callbacks (e.g. after a bot restart)
+    async def _stale_receipt_cb(update: Update, context: CallbackContext) -> None:
+        query = update.callback_query
+        await query.answer()
+        await query.message.reply_text(
+            "This receipt session has expired (the bot may have restarted).\n"
+            "Please start a new expense via Add Expense → Scan Receipt.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            _stale_receipt_cb,
+            pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel)$",
+        )
+    )
+
     setup_weekly_job(app)
     setup_chronicler_backup_job(app)
 
