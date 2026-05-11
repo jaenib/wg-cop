@@ -670,7 +670,7 @@ def parse_receipt_text(text: str):
     return items
 
 
-def extract_items_from_receipt(image_path: str):
+def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     if not _openai_lib or not OPENAI_API_KEY:
         raise ReceiptParsingError("Receipt scanning is not configured (missing OPENAI_API_KEY).")
 
@@ -680,8 +680,7 @@ def extract_items_from_receipt(image_path: str):
     except Exception as exc:
         raise ReceiptParsingError("Failed to read the receipt image.") from exc
 
-    ext = image_path.rsplit(".", 1)[-1].lower()
-    media_type = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+    media_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
 
     client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
     try:
@@ -730,9 +729,21 @@ def extract_items_from_receipt(image_path: str):
     if not items:
         raise ReceiptParsingError("No line items found in receipt.")
 
+    try:
+        normalised = []
+        for i in items:
+            if not isinstance(i, dict) or "name" not in i or i.get("amount") is None:
+                continue
+            normalised.append({"name": str(i["name"]), "amount": round(float(i["amount"]), 2)})
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ReceiptParsingError(f"Failed to parse item data: {exc}") from exc
+
+    if not normalised:
+        raise ReceiptParsingError("No valid line items found in receipt.")
+
     return {
         "description": description,
-        "items": [{"name": str(i["name"]), "amount": round(float(i["amount"]), 2)} for i in items],
+        "items": normalised,
     }
 
 
@@ -908,10 +919,12 @@ async def expense_amount(update: Update, context: CallbackContext) -> int:
 
 async def expense_receipt_photo(update: Update, context: CallbackContext) -> int:
     telegram_file = None
+    mime_type = "image/jpeg"
     if update.message.photo:
         telegram_file = await update.message.photo[-1].get_file()
     elif update.message.document:
         telegram_file = await update.message.document.get_file()
+        mime_type = update.message.document.mime_type or "image/jpeg"
 
     if not telegram_file:
         await update.message.reply_text(
@@ -927,7 +940,7 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         await telegram_file.download_to_drive(tmp_path)
 
         try:
-            result = extract_items_from_receipt(tmp_path)
+            result = extract_items_from_receipt(tmp_path, mime_type=mime_type)
         except ReceiptParsingError as exc:
             logger.info("Receipt OCR failed: %s", exc)
             await update.message.reply_text(
@@ -2639,6 +2652,7 @@ def main():
             ],
             EXPENSE_RECEIPT: [
                 MessageHandler(RECEIPT_IMAGE_FILTER, expense_receipt_photo),
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_invalid),
             ],
             EXPENSE_RECEIPT_MANUAL: [
