@@ -68,7 +68,7 @@ RECEIPT_TOLERANCE_CHF = 0.50  # max sum-vs-total gap before retry
 
 # Data storage
 DATA_FILE = os.environ.get("WG_COP_DATA_FILE", "wg_data_alpha.json")
-BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), "backups")
+BACKUP_DIR = os.environ.get("WG_COP_BACKUP_DIR", "/var/backups/wg_cop")
 BACKUP_KEEP = 14  # 7 days × 2 backups/day
 
 
@@ -342,6 +342,8 @@ CB_SPLIT_CANCEL = "split_cancel"
 CB_RECEIPT_TOGGLE_PREFIX = "receipt_toggle:"
 CB_RECEIPT_DONE = "receipt_done"
 CB_RECEIPT_CANCEL = "receipt_cancel"
+CB_RECEIPT_ACCEPT = "receipt_accept"
+CB_RECEIPT_MANUAL = "receipt_manual"
 
 # Settings
 EXPENSE_LIST_LIMIT = 20
@@ -355,8 +357,7 @@ EXPENSE_LIST_LIMIT = 20
     EXPENSE_SPLIT,
     EXPENSE_RECEIPT,
     EXPENSE_RECEIPT_REVIEW,
-    EXPENSE_RECEIPT_CONFIRM_TOTAL,
-) = range(8)
+) = range(7)
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
 MANAGE_MEMBER = range(1)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
@@ -404,13 +405,23 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("Member Management")],
-            [KeyboardButton("Set Weekly Report")],
-            [KeyboardButton("Set Report Time")],
-            [KeyboardButton("Trigger Weekly Report")],
+            [KeyboardButton("Manage Weekly Report")],
             [KeyboardButton("Adjust Beer Count")],
             [KeyboardButton("Set WG-Höck")],
             [KeyboardButton("System Overview")],
             [KeyboardButton("Back to Settings")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_weekly_report_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Set Weekly Report")],
+            [KeyboardButton("Set Report Time")],
+            [KeyboardButton("Trigger Weekly Report")],
+            [KeyboardButton("Back to Admin")],
         ],
         resize_keyboard=True,
     )
@@ -477,6 +488,20 @@ async def settings_back(update: Update, context: CallbackContext) -> None:
 
 
 async def open_admin_menu(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    await update.message.reply_text("Admin panel:", reply_markup=get_admin_keyboard())
+
+
+async def open_weekly_report_menu(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    await update.message.reply_text("Weekly report settings:", reply_markup=get_weekly_report_keyboard())
+
+
+async def back_to_admin(update: Update, context: CallbackContext) -> None:
     if update.effective_user.id != BOT_HANDLER_ID:
         await update.message.reply_text("Unauthorized.")
         return
@@ -730,18 +755,26 @@ def build_split_inline_kb(members, selected):
     return InlineKeyboardMarkup(rows)
 
 
-def _receipt_shared_total(items, selected, confirmed_total=None):
-    all_sum = sum(item["amount"] for item in items)
-    selected_sum = sum(items[i]["amount"] for i in selected if i < len(items))
-    if confirmed_total is not None and all_sum:
-        if len(selected) == len(items):
-            return confirmed_total
-        return round(confirmed_total * selected_sum / all_sum, 2)
-    return round(selected_sum, 2)
+def _receipt_shared_total(items, selected):
+    return round(sum(items[i]["amount"] for i in selected if i < len(items)), 2)
 
 
-def build_receipt_items_text(items, selected, confirmed_total=None):
-    total = _receipt_shared_total(items, selected, confirmed_total)
+def _adjust_items_to_total(items, receipt_total):
+    """Scale item amounts proportionally so they sum to receipt_total."""
+    items_sum = sum(item["amount"] for item in items)
+    if not items_sum or abs(items_sum - receipt_total) < 0.01:
+        return items
+    scale = receipt_total / items_sum
+    adjusted = [{"name": item["name"], "amount": round(item["amount"] * scale, 2)} for item in items]
+    diff = round(receipt_total - sum(a["amount"] for a in adjusted), 2)
+    if diff and adjusted:
+        largest = max(range(len(adjusted)), key=lambda i: adjusted[i]["amount"])
+        adjusted[largest]["amount"] = round(adjusted[largest]["amount"] + diff, 2)
+    return adjusted
+
+
+def build_receipt_items_text(items, selected):
+    total = _receipt_shared_total(items, selected)
     return f"Tap items to exclude personal ones.\n\nShared total: CHF {total:.2f}"
 
 
@@ -1193,69 +1226,46 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
     gap = result.get("gap") if isinstance(result, dict) else None
     if gap is None and receipt_total is not None:
         gap = abs(items_sum - receipt_total)
-    suggested_total = receipt_total if receipt_total else items_sum
     has_mismatch = receipt_total is not None and gap is not None and gap > 0.02
 
     context.user_data["mode"] = "receipt"
     context.user_data["receipt_items"] = items
-    context.user_data["receipt_parsed_total"] = items_sum
+    context.user_data["receipt_total"] = receipt_total
     if isinstance(result, dict) and result.get("description"):
         context.user_data["receipt_description"] = result["description"]
 
-    await analysing_msg.delete()
-    total_kb = ReplyKeyboardMarkup(
-        [[f"{suggested_total:.2f}"]],
-        one_time_keyboard=True,
-        resize_keyboard=True,
+    item_lines = "\n".join(
+        f"  {item['name']} — CHF {item['amount']:.2f}" for item in items
     )
     if has_mismatch:
-        total_prompt = (
-            f"Found {len(items)} items. Items sum: <b>CHF {items_sum:.2f}</b> | "
-            f"Receipt total: <b>CHF {receipt_total:.2f}</b>\n"
-            f"⚠️ <b>CHF {gap:.2f}</b> gap — some item amounts may be off.\n"
-            "Tap to confirm or type the correct total:"
+        effective = receipt_total
+        summary = (
+            f"Found {len(items)} items (sum: CHF {items_sum:.2f} | receipt total: CHF {receipt_total:.2f}):\n"
+            f"{item_lines}\n\n"
+            f"Gap of CHF {gap:.2f} will be spread proportionally. Accept this parse?"
         )
     else:
-        total_prompt = (
-            f"Found {len(items)} items. Receipt total: <b>CHF {suggested_total:.2f}</b>\n"
-            "Tap to confirm or type the correct total:"
+        effective = receipt_total if receipt_total else items_sum
+        summary = (
+            f"Found {len(items)} items (total: CHF {effective:.2f}):\n"
+            f"{item_lines}\n\n"
+            "Accept this parse?"
         )
+
+    confirm_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes, continue", callback_data=CB_RECEIPT_ACCEPT),
+            InlineKeyboardButton("No, manual entry", callback_data=CB_RECEIPT_MANUAL),
+        ]
+    ])
+    await analysing_msg.delete()
     await update.message.reply_text(
-        total_prompt,
-        parse_mode="HTML",
-        reply_markup=total_kb,
-    )
-    return EXPENSE_RECEIPT_CONFIRM_TOTAL
-
-
-async def expense_receipt_confirm_total(update: Update, context: CallbackContext) -> int:
-    text = update.message.text.strip()
-    if text.lower() == "cancel":
-        return await cancel(update, context)
-
-    try:
-        confirmed_total = round(float(text.replace(",", ".")), 2)
-    except ValueError:
-        await update.message.reply_text("Please enter a valid amount (e.g. 129.50).")
-        return EXPENSE_RECEIPT_CONFIRM_TOTAL
-
-    items = context.user_data.get("receipt_items", [])
-    if not items:
-        await update.message.reply_text(
-            "Session data was lost (the bot may have restarted). Please send the receipt photo again.",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
-        )
-        return EXPENSE_RECEIPT
-
-    context.user_data["confirmed_total"] = confirmed_total
-    context.user_data["amount"] = confirmed_total
-    context.user_data["receipt_selected"] = set(range(len(items)))
-
-    await update.message.reply_text(
-        build_receipt_items_text(items, context.user_data["receipt_selected"], confirmed_total),
-        reply_markup=build_receipt_items_kb(items, context.user_data["receipt_selected"]),
+        summary,
+        reply_markup=confirm_kb,
     )
     return EXPENSE_RECEIPT_REVIEW
+
+
 
 
 async def expense_receipt_invalid(update: Update, context: CallbackContext) -> int:
@@ -1288,7 +1298,29 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
         )
         return ConversationHandler.END
 
-    confirmed_total = context.user_data.get("confirmed_total")
+    if query.data == CB_RECEIPT_MANUAL:
+        context.user_data.clear()
+        context.user_data["mode"] = "manual"
+        await query.edit_message_text("Switching to manual entry.")
+        await query.message.reply_text(
+            "Enter a short description for the expense (e.g., 'Groceries Migros'):",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EXPENSE_DESCRIPTION
+
+    if query.data == CB_RECEIPT_ACCEPT:
+        receipt_total = context.user_data.get("receipt_total")
+        if receipt_total is not None:
+            items = _adjust_items_to_total(items, receipt_total)
+            context.user_data["receipt_items"] = items
+        selected = set(range(len(items)))
+        context.user_data["receipt_selected"] = selected
+        context.user_data["amount"] = _receipt_shared_total(items, selected)
+        await query.edit_message_text(
+            build_receipt_items_text(items, selected),
+            reply_markup=build_receipt_items_kb(items, selected),
+        )
+        return EXPENSE_RECEIPT_REVIEW
 
     if query.data == CB_RECEIPT_DONE:
         if not selected:
@@ -1296,7 +1328,7 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
             return EXPENSE_RECEIPT_REVIEW
 
         chosen = [items[i] for i in sorted(selected)]
-        total = _receipt_shared_total(items, selected, confirmed_total)
+        total = _receipt_shared_total(items, selected)
         context.user_data["selected_items"] = chosen
         context.user_data["amount"] = total
 
@@ -1333,7 +1365,7 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
             context.user_data["receipt_selected"] = selected
 
         await query.edit_message_text(
-            build_receipt_items_text(items, selected, confirmed_total),
+            build_receipt_items_text(items, selected),
             reply_markup=build_receipt_items_kb(items, selected),
         )
         return EXPENSE_RECEIPT_REVIEW
@@ -2190,13 +2222,30 @@ async def set_weekly_report(update: Update, context: CallbackContext) -> None:
             "Weekly reports will be sent to this group every Monday!"
         )
     else:
-        if "group_chat_id" in data:
+        effective_id = data.get("group_chat_id") or GROUP_CHAT_ID
+        if data.get("group_chat_id"):
+            source = "set via bot command"
+        elif GROUP_CHAT_ID:
+            source = "from config"
+        else:
+            source = None
+
+        if effective_id:
+            try:
+                chat = await context.bot.get_chat(effective_id)
+                group_name = chat.title or str(effective_id)
+            except Exception:
+                group_name = str(effective_id)
+            src_note = f" ({source})" if source else ""
             await update.message.reply_text(
-                "Weekly reports are set to be sent to a group chat. To change the group, use this command in the new group chat."
+                f"Active report group: {group_name}{src_note}\n\n"
+                "To change the group, send this command from within the new group chat.",
+                reply_markup=get_weekly_report_keyboard(),
             )
         else:
             await update.message.reply_text(
-                "Please use this command in the group chat where you want the weekly reports to be sent."
+                "No report group configured yet. Send this command from the group chat where you want weekly reports.",
+                reply_markup=get_weekly_report_keyboard(),
             )
 
 
@@ -2406,7 +2455,7 @@ async def admin_trigger_report(update: Update, context: CallbackContext) -> None
     if not data.get("members") or not data.get("chores"):
         await update.message.reply_text(
             "Not enough data yet. Add members and log some chores first.",
-            reply_markup=get_admin_keyboard(),
+            reply_markup=get_weekly_report_keyboard(),
         )
         return
 
@@ -2415,7 +2464,7 @@ async def admin_trigger_report(update: Update, context: CallbackContext) -> None
 
     await update.message.reply_text(
         f"[DRY RUN — not sent to group, no data changed]\n\n{report}",
-        reply_markup=get_admin_keyboard(),
+        reply_markup=get_weekly_report_keyboard(),
     )
 
 
@@ -2588,7 +2637,7 @@ async def admin_report_time_set(update: Update, context: CallbackContext) -> int
 
     await update.message.reply_text(
         f"Weekly report time set to {time_str} (Europe/Berlin, every Monday).",
-        reply_markup=get_admin_keyboard(),
+        reply_markup=get_weekly_report_keyboard(),
     )
     return ConversationHandler.END
 
@@ -2978,8 +3027,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
     app.add_handler(MessageHandler(filters.Regex("^Admin Panel$"), open_admin_menu))
     app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), back_to_settings))
+    app.add_handler(MessageHandler(filters.Regex("^Back to Admin$"), back_to_admin))
     app.add_handler(MessageHandler(filters.Regex("^System Overview$"), admin_system_overview))
     app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
+    app.add_handler(MessageHandler(filters.Regex("^Manage Weekly Report$"), open_weekly_report_menu))
     app.add_handler(MessageHandler(filters.Regex("^Manage "), open_manage_self))
 
     admin_beer_conv = ConversationHandler(
@@ -3063,13 +3114,10 @@ def main():
                 MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_invalid),
             ],
-            EXPENSE_RECEIPT_CONFIRM_TOTAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_confirm_total),
-            ],
             EXPENSE_RECEIPT_REVIEW: [
                 CallbackQueryHandler(
                     receipt_items_cb,
-                    pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel)$",
+                    pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel|receipt_accept|receipt_manual)$",
                 )
             ],
             EXPENSE_PAYER: [
