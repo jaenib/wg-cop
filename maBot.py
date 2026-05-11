@@ -535,7 +535,9 @@ def build_split_inline_kb(members, selected):
 def _receipt_shared_total(items, selected, confirmed_total=None):
     all_sum = sum(item["amount"] for item in items)
     selected_sum = sum(items[i]["amount"] for i in selected if i < len(items))
-    if confirmed_total and all_sum:
+    if confirmed_total is not None and all_sum:
+        if len(selected) == len(items):
+            return confirmed_total
         return round(confirmed_total * selected_sum / all_sum, 2)
     return round(selected_sum, 2)
 
