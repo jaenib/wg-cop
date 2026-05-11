@@ -325,6 +325,7 @@ EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
 ADMIN_BEER_MEMBER, ADMIN_BEER_COUNT = range(2)
 ADMIN_HOECK_DATE = 0  # single-state conv
+CHANGE_USERNAME_NEW = 0  # single-state conv
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
 
@@ -351,13 +352,9 @@ def get_member_keyboard(data):
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-def get_settings_keyboard(is_admin=False):
-    buttons = [
-        [KeyboardButton("Manage Members")],
-        [KeyboardButton("Edit Entries")],
-        [KeyboardButton("Set Weekly Report")],
-        [KeyboardButton("Set Vacation Status")],
-    ]
+def get_settings_keyboard(is_admin=False, username=None):
+    label = f"Manage {username}" if username else "Manage Profile"
+    buttons = [[KeyboardButton(label)]]
     if is_admin:
         buttons.append([KeyboardButton("Admin Panel")])
     buttons.append([KeyboardButton("Back to Main Menu")])
@@ -367,9 +364,23 @@ def get_settings_keyboard(is_admin=False):
 def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         [
+            [KeyboardButton("Member Management")],
+            [KeyboardButton("Set Weekly Report")],
             [KeyboardButton("Trigger Weekly Report")],
             [KeyboardButton("Adjust Beer Count")],
             [KeyboardButton("Set WG-Höck")],
+            [KeyboardButton("Back to Settings")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_manage_self_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Set Vacation Status")],
+            [KeyboardButton("Edit Entries")],
+            [KeyboardButton("Change Username")],
             [KeyboardButton("Back to Settings")],
         ],
         resize_keyboard=True,
@@ -404,10 +415,17 @@ async def open_penalties(update: Update, context: CallbackContext) -> None:
     )
 
 
+def _settings_keyboard_for_user(user):
+    is_admin = user.id == BOT_HANDLER_ID
+    member = _resolve_member_for_user(user)
+    username = _get_member_name(member) if member else None
+    return get_settings_keyboard(is_admin=is_admin, username=username)
+
+
 async def open_settings(update: Update, context: CallbackContext) -> None:
-    is_admin = update.effective_user.id == BOT_HANDLER_ID
     await update.message.reply_text(
-        "Settings menu:", reply_markup=get_settings_keyboard(is_admin=is_admin)
+        "Settings menu:",
+        reply_markup=_settings_keyboard_for_user(update.effective_user),
     )
 
 
@@ -424,12 +442,24 @@ async def open_admin_menu(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text("Admin panel:", reply_markup=get_admin_keyboard())
 
 
-async def admin_back(update: Update, context: CallbackContext) -> None:
-    if update.effective_user.id != BOT_HANDLER_ID:
-        await update.message.reply_text("Unauthorized.")
-        return
+async def back_to_settings(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(
-        "Settings menu:", reply_markup=get_settings_keyboard(is_admin=True)
+        "Settings menu:",
+        reply_markup=_settings_keyboard_for_user(update.effective_user),
+    )
+
+
+async def open_manage_self(update: Update, context: CallbackContext) -> None:
+    member = _resolve_member_for_user(update.effective_user)
+    if not member:
+        await update.message.reply_text(
+            "I can't match you to a household member. Ask an admin to add you."
+        )
+        return
+    username = _get_member_name(member)
+    await update.message.reply_text(
+        f"Managing your profile: {username}",
+        reply_markup=get_manage_self_keyboard(),
     )
 
 
@@ -653,6 +683,9 @@ async def start(update: Update, context: CallbackContext) -> None:
 
 # Manage Members
 async def manage_members(update: Update, context: CallbackContext) -> int:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
     data = load_data()
     if data["members"]:
         members_list = ", ".join(_get_member_name(m) for m in data["members"])
@@ -1101,6 +1134,41 @@ async def chore_user(update: Update, context: CallbackContext) -> int:
         "How many minutes did it take?", reply_markup=ReplyKeyboardRemove()
     )
     return CHORE_MINUTES
+
+
+def _rename_member_in_data(data: dict, old_name: str, new_name: str) -> None:
+    """Atomically rename a member across all data structures."""
+    old_norm = _normalise_member_name(old_name)
+
+    for m in data.get("members") or []:
+        if isinstance(m, dict) and _normalise_member_name(m.get("name", "")) == old_norm:
+            m["name"] = new_name
+
+    chores = data.setdefault("chores", {})
+    if old_name in chores:
+        chores[new_name] = chores.pop(old_name)
+
+    penalties = data.setdefault("penalties", {})
+    if old_name in penalties:
+        penalties[new_name] = penalties.pop(old_name)
+
+    violators = data.setdefault("last_week_violators", {})
+    old_v_key = _normalise_member_name(old_name)
+    new_v_key = _normalise_member_name(new_name)
+    if old_v_key in violators:
+        violators[new_v_key] = violators.pop(old_v_key)
+
+    for entry in data.get("chore_log") or []:
+        if _normalise_member_name(entry.get("member", "")) == old_norm:
+            entry["member"] = new_name
+
+    for expense in data.get("expenses") or []:
+        if _normalise_member_name(expense.get("payer", "")) == old_norm:
+            expense["payer"] = new_name
+        expense["split_with"] = [
+            new_name if _normalise_member_name(p) == old_norm else p
+            for p in expense.get("split_with") or []
+        ]
 
 
 def add_chore_entry(data, member: str, points: int, description: str | None = None):
@@ -1763,6 +1831,9 @@ async def edit_entries_split(update: Update, context: CallbackContext) -> int:
 
 # Weekly report handling
 async def set_weekly_report(update: Update, context: CallbackContext) -> None:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
     data = load_data()
 
     if update.effective_chat.type in ["group", "supergroup"]:
@@ -2300,6 +2371,45 @@ async def cancel(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
+async def start_change_username(update: Update, context: CallbackContext) -> int:
+    member = _resolve_member_for_user(update.effective_user)
+    if not member:
+        await update.message.reply_text(
+            "I can't match you to a household member.",
+            reply_markup=get_manage_self_keyboard(),
+        )
+        return ConversationHandler.END
+    current_name = _get_member_name(member)
+    context.user_data["change_username_old"] = current_name
+    await update.message.reply_text(
+        f"Current username: {current_name}\n\nSend your new username:",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
+    )
+    return CHANGE_USERNAME_NEW
+
+
+async def do_change_username(update: Update, context: CallbackContext) -> int:
+    new_name = update.message.text.strip()
+    old_name = context.user_data.get("change_username_old", "")
+    data = load_data()
+
+    if _match_member_name(data.get("members") or [], new_name):
+        await update.message.reply_text(
+            f"'{new_name}' is already taken. Try a different name:"
+        )
+        return CHANGE_USERNAME_NEW
+
+    _rename_member_in_data(data, old_name, new_name)
+    save_data(data)
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"Username changed to {new_name}!",
+        reply_markup=get_manage_self_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def set_vacation_status(update: Update, context: CallbackContext) -> None:
     """Toggle vacation status. Usage: /setstatus or /setstatus <name>"""
     data = load_data()
@@ -2349,18 +2459,21 @@ async def set_vacation_status(update: Update, context: CallbackContext) -> None:
             break
     
     save_data(data)
-    
+
+    # Return to manage-self submenu when button-triggered; main menu for /setstatus commands
+    reply_kb = get_main_keyboard() if context.args else get_manage_self_keyboard()
+
     if new_status == "vacating":
         await update.message.reply_text(
             f"{member_name}, you are now on vacation. "
             f"You will appear at the bottom when selecting splitters, "
             f"to remind others to only include you for long-term expenses.",
-            reply_markup=get_main_keyboard()
+            reply_markup=reply_kb,
         )
     else:
         await update.message.reply_text(
             f"{member_name}, you are now active.",
-            reply_markup=get_main_keyboard()
+            reply_markup=reply_kb,
         )
 
 
@@ -2397,8 +2510,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Settings$"), open_settings))
     app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
     app.add_handler(MessageHandler(filters.Regex("^Admin Panel$"), open_admin_menu))
-    app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), admin_back))
+    app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), back_to_settings))
     app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
+    app.add_handler(MessageHandler(filters.Regex("^Manage "), open_manage_self))
     app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     admin_beer_conv = ConversationHandler(
@@ -2489,7 +2603,7 @@ def main():
     app.add_handler(expense_conv)
 
     manage_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Manage Members$"), manage_members)],
+        entry_points=[MessageHandler(filters.Regex("^Member Management$"), manage_members)],
         states={
             MANAGE_MEMBER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, modify_members)
@@ -2505,6 +2619,24 @@ def main():
         conversation_timeout=300,
     )
     app.add_handler(manage_conv)
+
+    change_username_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Change Username$"), start_change_username)],
+        states={
+            CHANGE_USERNAME_NEW: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, do_change_username)
+            ],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, on_timeout)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Cancel$"), cancel),
+        ],
+        conversation_timeout=300,
+    )
+    app.add_handler(change_username_conv)
 
     edit_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Edit Entries$"), start_edit_entries)],
