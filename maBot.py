@@ -3382,9 +3382,11 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^Adjust Beer Count$"), admin_beer_start)],
         states={
             ADMIN_BEER_MEMBER: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_member)
             ],
             ADMIN_BEER_COUNT: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_count)
             ],
             ConversationHandler.TIMEOUT: [
@@ -3403,7 +3405,10 @@ def main():
     admin_hoeck_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^Set WG-Höck$"), admin_hoeck_start)],
         states={
-            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_hoeck_date)],
+            0: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_hoeck_date),
+            ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
             ],
@@ -3420,7 +3425,10 @@ def main():
     admin_report_time_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Set Report Time$"), admin_report_time_start)],
         states={
-            ADMIN_REPORT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_report_time_set)],
+            ADMIN_REPORT_TIME: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_report_time_set),
+            ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
             ],
@@ -3455,6 +3463,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_confirm_total),
             ],
             EXPENSE_RECEIPT_MANUAL: [
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, expense_receipt_manual_items
                 )
@@ -3561,10 +3570,12 @@ def main():
         states={
             REDEEM_MEMBER: [
                 MessageHandler(_nav_pattern, cancel),
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_member),
             ],
             REDEEM_COUNT: [
                 MessageHandler(_nav_pattern, cancel),
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_count),
             ],
             ConversationHandler.TIMEOUT: [
