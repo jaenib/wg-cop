@@ -20,7 +20,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, CallbackContext,
-    ConversationHandler, CallbackQueryHandler,
+    ConversationHandler, CallbackQueryHandler, PicklePersistence,
 )
 from telegram.error import TelegramError
 
@@ -994,6 +994,13 @@ async def expense_receipt_confirm_total(update: Update, context: CallbackContext
         return EXPENSE_RECEIPT_CONFIRM_TOTAL
 
     items = context.user_data.get("receipt_items", [])
+    if not items:
+        await update.message.reply_text(
+            "Session data was lost (the bot may have restarted). Please send the receipt photo again.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
+        )
+        return EXPENSE_RECEIPT
+
     context.user_data["confirmed_total"] = confirmed_total
     context.user_data["amount"] = confirmed_total
     context.user_data["receipt_selected"] = set(range(len(items)))
@@ -2607,7 +2614,8 @@ async def on_timeout(update: Update, context: CallbackContext) -> int:
 
 def main():
     data = load_data()
-    app = Application.builder().token(TOKEN).build()
+    persistence = PicklePersistence(filepath="bot_persistence.pkl")
+    app = Application.builder().token(TOKEN).persistence(persistence).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("expenses", list_expenses))
