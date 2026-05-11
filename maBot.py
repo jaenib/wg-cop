@@ -329,7 +329,8 @@ EXPENSE_LIST_LIMIT = 20
     EXPENSE_RECEIPT,
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_RECEIPT_MANUAL,
-) = range(8)
+    EXPENSE_RECEIPT_CONFIRM_TOTAL,
+) = range(9)
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
 MANAGE_MEMBER = range(1)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
@@ -532,19 +533,8 @@ def build_split_inline_kb(members, selected):
 
 
 def build_receipt_items_text(items, selected):
-    lines = ["Toggle items to exclude them from the shared expense:"]
-    total = 0.0
-    for idx, item in enumerate(items):
-        picked = idx in selected
-        marker = "[x]" if picked else "[ ]"
-        lines.append(
-            f"{marker} {item['name']} — {item['amount']:.2f}"
-        )
-        if picked:
-            total += item["amount"]
-    lines.append("")
-    lines.append(f"Current shared total: {total:.2f}")
-    return "\n".join(lines)
+    total = sum(items[i]["amount"] for i in selected)
+    return f"Tap items to exclude personal ones.\n\nShared total: CHF {total:.2f}"
 
 
 def build_receipt_items_kb(items, selected):
@@ -885,24 +875,6 @@ async def expense_amount(update: Update, context: CallbackContext) -> int:
         return EXPENSE_AMOUNT
 
     context.user_data.setdefault("mode", "manual")
-    if context.user_data.get("mode") == "receipt":
-        auto_desc = context.user_data.get("receipt_description", "")
-        if auto_desc:
-            desc_kb = ReplyKeyboardMarkup(
-                [[auto_desc]],
-                one_time_keyboard=True,
-                resize_keyboard=True,
-            )
-            await update.message.reply_text(
-                f"Suggested description: <b>{html.escape(auto_desc)}</b>\nTap to use it or type your own:",
-                parse_mode="HTML",
-                reply_markup=desc_kb,
-            )
-        else:
-            await update.message.reply_text(
-                "Enter a short description:", reply_markup=ReplyKeyboardRemove()
-            )
-        return EXPENSE_DESCRIPTION
     return await _prompt_for_payer(update.message, context)
 
 
@@ -919,8 +891,11 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         )
         return EXPENSE_RECEIPT
 
+    analysing_msg = await update.message.reply_text(
+        "Received! Analysing receipt...", reply_markup=ReplyKeyboardRemove()
+    )
+
     tmp_path = None
-    items = []
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
             tmp_path = tmp.name
@@ -930,6 +905,7 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
             result = extract_items_from_receipt(tmp_path)
         except ReceiptParsingError as exc:
             logger.info("Receipt OCR failed: %s", exc)
+            await analysing_msg.delete()
             await update.message.reply_text(
                 "I couldn't read the receipt automatically."
                 "\nPlease send the items as text in the format 'Item - price',"
@@ -943,22 +919,63 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
 
     items = result.get("items", []) if isinstance(result, dict) else result
     if not items:
+        await analysing_msg.delete()
         await update.message.reply_text(
             "I couldn't find any purchasable items. Please send them as text, one per line."
         )
         return EXPENSE_RECEIPT_MANUAL
 
+    parsed_total = round(sum(item["amount"] for item in items), 2)
+
     context.user_data["mode"] = "receipt"
     context.user_data["receipt_items"] = items
+    context.user_data["receipt_parsed_total"] = parsed_total
     if isinstance(result, dict) and result.get("description"):
         context.user_data["receipt_description"] = result["description"]
+
+    await analysing_msg.delete()
+    total_kb = ReplyKeyboardMarkup(
+        [[f"{parsed_total:.2f}"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        f"Found {len(items)} items. Parsed total: <b>CHF {parsed_total:.2f}</b>\n"
+        "Does this match your receipt? Tap to confirm or type the correct total:",
+        parse_mode="HTML",
+        reply_markup=total_kb,
+    )
+    return EXPENSE_RECEIPT_CONFIRM_TOTAL
+
+
+async def expense_receipt_confirm_total(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    if text.lower() == "cancel":
+        return await cancel(update, context)
+
+    try:
+        confirmed_total = round(float(text.replace(",", ".")), 2)
+    except ValueError:
+        await update.message.reply_text("Please enter a valid amount (e.g. 129.50).")
+        return EXPENSE_RECEIPT_CONFIRM_TOTAL
+
+    items = context.user_data.get("receipt_items", [])
+    parsed_total = context.user_data.get("receipt_parsed_total", 0)
+
+    if parsed_total and parsed_total != confirmed_total:
+        scale = confirmed_total / parsed_total
+        items = [
+            {"name": item["name"], "amount": round(item["amount"] * scale, 2)}
+            for item in items
+        ]
+        context.user_data["receipt_items"] = items
+
+    context.user_data["amount"] = confirmed_total
     context.user_data["receipt_selected"] = set(range(len(items)))
 
     await update.message.reply_text(
         build_receipt_items_text(items, context.user_data["receipt_selected"]),
-        reply_markup=build_receipt_items_kb(
-            items, context.user_data["receipt_selected"]
-        ),
+        reply_markup=build_receipt_items_kb(items, context.user_data["receipt_selected"]),
     )
     return EXPENSE_RECEIPT_REVIEW
 
@@ -1023,24 +1040,25 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
         chosen = [items[i] for i in sorted(selected)]
         total = round(sum(item["amount"] for item in chosen), 2)
         context.user_data["selected_items"] = chosen
+        context.user_data["amount"] = total
 
-        lines = ["Selected items:"]
-        for item in chosen:
-            lines.append(f"• {item['name']} — {item['amount']:.2f}")
+        await query.edit_message_text(f"Shared total: CHF {total:.2f}")
 
-        await query.edit_message_text("\n".join(lines))
-
-        amount_kb = ReplyKeyboardMarkup(
-            [[f"{total:.2f}"]],
-            one_time_keyboard=True,
-            resize_keyboard=True,
-        )
-        await query.message.reply_text(
-            f"Parsed subtotal: <b>CHF {total:.2f}</b>\nConfirm or enter the correct receipt total:",
-            parse_mode="HTML",
-            reply_markup=amount_kb,
-        )
-        return EXPENSE_AMOUNT
+        auto_desc = context.user_data.get("receipt_description", "")
+        if auto_desc:
+            desc_kb = ReplyKeyboardMarkup(
+                [[auto_desc]], one_time_keyboard=True, resize_keyboard=True
+            )
+            await query.message.reply_text(
+                f"Suggested description: <b>{html.escape(auto_desc)}</b>\nTap to use it or type your own:",
+                parse_mode="HTML",
+                reply_markup=desc_kb,
+            )
+        else:
+            await query.message.reply_text(
+                "Enter a short description:", reply_markup=ReplyKeyboardRemove()
+            )
+        return EXPENSE_DESCRIPTION
 
     if query.data.startswith(CB_RECEIPT_TOGGLE_PREFIX):
         try:
@@ -2640,6 +2658,9 @@ def main():
             EXPENSE_RECEIPT: [
                 MessageHandler(RECEIPT_IMAGE_FILTER, expense_receipt_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_invalid),
+            ],
+            EXPENSE_RECEIPT_CONFIRM_TOTAL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_confirm_total),
             ],
             EXPENSE_RECEIPT_MANUAL: [
                 MessageHandler(
