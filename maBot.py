@@ -25,9 +25,9 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 try:
-    import anthropic as _anthropic_lib
+    import openai as _openai_lib
 except ImportError:  # pragma: no cover - optional dependency
-    _anthropic_lib = None
+    _openai_lib = None
 
 # Set up logging
 logging.basicConfig(
@@ -62,7 +62,7 @@ GY_ID = getattr(_config, "GY_ID")
 TO_ID = getattr(_config, "TO_ID")
 JA_ID = getattr(_config, "JA_ID")
 UIDS = [NI_ID, GI_ID, GY_ID, TO_ID, JA_ID]
-ANTHROPIC_API_KEY = getattr(_config, "ANTHROPIC_API_KEY", None)
+OPENAI_API_KEY = getattr(_config, "OPENAI_API_KEY", None)
 
 # Data storage
 DATA_FILE = "wg_data_alpha.json"
@@ -671,8 +671,8 @@ def parse_receipt_text(text: str):
 
 
 def extract_items_from_receipt(image_path: str):
-    if not _anthropic_lib or not ANTHROPIC_API_KEY:
-        raise ReceiptParsingError("Receipt scanning is not configured (missing ANTHROPIC_API_KEY).")
+    if not _openai_lib or not OPENAI_API_KEY:
+        raise ReceiptParsingError("Receipt scanning is not configured (missing OPENAI_API_KEY).")
 
     try:
         with open(image_path, "rb") as f:
@@ -683,17 +683,17 @@ def extract_items_from_receipt(image_path: str):
     ext = image_path.rsplit(".", 1)[-1].lower()
     media_type = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
 
-    client = _anthropic_lib.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
     try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
             max_tokens=1024,
             messages=[{
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": image_data},
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{image_data}"},
                     },
                     {
                         "type": "text",
@@ -714,7 +714,7 @@ def extract_items_from_receipt(image_path: str):
     except Exception as exc:
         raise ReceiptParsingError(f"Vision API error: {exc}") from exc
 
-    raw = message.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
     try:
         start = raw.index("[")
         end = raw.rindex("]") + 1
