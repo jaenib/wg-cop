@@ -33,7 +33,7 @@ jobs:
             git fetch origin main
             git checkout -f main
             git reset --hard origin/main
-            git clean -fd
+            git clean -fd -e 'wg_data_*.json*' -e 'bot_persistence.pkl'
 
             if [ ! -x ./venv/bin/python ]; then
               python3 -m venv venv

@@ -74,7 +74,7 @@ RECEIPT_LOCAL_OCR_ENABLED = str(
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Data storage
-DATA_FILE = "wg_data_alpha.json"
+DATA_FILE = os.environ.get("WG_COP_DATA_FILE", "wg_data_alpha.json")
 
 
 def _get_chronicler_chat_id():
