@@ -698,10 +698,11 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
                         "type": "text",
                         "text": (
                             "Extract every purchased line item from this receipt and suggest a short expense description.\n"
-                            "Return ONLY a JSON object — no markdown, no explanation — in this format:\n"
-                            '{"description": "Migros groceries", "items": [{"name": "Product name", "amount": 9.95}, ...]}\n\n'
+                            "Return ONLY a JSON object — no markdown, no explanation — in this exact format:\n"
+                            '{"description": "Migros groceries", "receipt_total": 129.50, "items": [{"name": "Product name", "amount": 9.95}, ...]}\n\n'
                             "Rules:\n"
                             "- description: 2-4 words, store name + category (e.g. 'Migros groceries', 'Lidl snacks')\n"
+                            "- receipt_total: read the grand total printed at the bottom of the receipt (e.g. 'TOTAL CHF 129.50') — copy it exactly as a number\n"
                             "- For each item use the TOTAL column (the rightmost price on the line) as the amount — never multiply Menge × Preis yourself\n"
                             "- For weighted items (e.g. 0.275 kg) the Total column already shows the CHF amount charged; use it as-is\n"
                             "- For discounted items use the discounted/action price shown in the Total column, not the original price\n"
@@ -724,6 +725,12 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
         parsed = json.loads(raw[start:end])
         items = parsed["items"]
         description = str(parsed.get("description", "")).strip()
+        receipt_total = parsed.get("receipt_total")
+        if receipt_total is not None:
+            try:
+                receipt_total = round(float(receipt_total), 2)
+            except (TypeError, ValueError):
+                receipt_total = None
     except (ValueError, json.JSONDecodeError, KeyError) as exc:
         raise ReceiptParsingError(f"Could not parse API response as JSON: {exc}") from exc
 
@@ -744,6 +751,7 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
 
     return {
         "description": description,
+        "receipt_total": receipt_total,
         "items": normalised,
     }
 
@@ -949,23 +957,25 @@ async def expense_receipt_photo(update: Update, context: CallbackContext) -> int
         )
         return EXPENSE_RECEIPT_MANUAL
 
-    parsed_total = round(sum(item["amount"] for item in items), 2)
+    items_sum = round(sum(item["amount"] for item in items), 2)
+    receipt_total = result.get("receipt_total") if isinstance(result, dict) else None
+    suggested_total = receipt_total if receipt_total else items_sum
 
     context.user_data["mode"] = "receipt"
     context.user_data["receipt_items"] = items
-    context.user_data["receipt_parsed_total"] = parsed_total
+    context.user_data["receipt_parsed_total"] = items_sum
     if isinstance(result, dict) and result.get("description"):
         context.user_data["receipt_description"] = result["description"]
 
     await analysing_msg.delete()
     total_kb = ReplyKeyboardMarkup(
-        [[f"{parsed_total:.2f}"]],
+        [[f"{suggested_total:.2f}"]],
         one_time_keyboard=True,
         resize_keyboard=True,
     )
     await update.message.reply_text(
-        f"Found {len(items)} items. Parsed total: <b>CHF {parsed_total:.2f}</b>\n"
-        "Does this match your receipt? Tap to confirm or type the correct total:",
+        f"Found {len(items)} items. Receipt total: <b>CHF {suggested_total:.2f}</b>\n"
+        "Tap to confirm or type the correct total:",
         parse_mode="HTML",
         reply_markup=total_kb,
     )
