@@ -75,6 +75,8 @@ RECEIPT_LOCAL_OCR_ENABLED = str(
 
 # Data storage
 DATA_FILE = os.environ.get("WG_COP_DATA_FILE", "wg_data_alpha.json")
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), "backups")
+BACKUP_KEEP = 14  # 7 days × 2 backups/day
 
 
 def _get_chronicler_chat_id():
@@ -140,22 +142,39 @@ def load_data():
 
 
 def save_data(data):
-    """Save bot data safely, keeping timestamped backups."""
-    if os.path.exists(DATA_FILE):
-        # Make timestamped backup before overwriting
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        backup_file = f"{DATA_FILE}.{timestamp}.bak"
-        try:
-            shutil.copy2(DATA_FILE, backup_file)
-            print(f"[wg-cop] Backup created: {backup_file}")
-        except Exception as e:
-            print(f"[wg-cop] Warning: failed to backup data file: {e}")
-
-    # Now overwrite safely
+    """Atomically overwrite the data file. Backups are written by a scheduled job, not here."""
     tmp_file = DATA_FILE + ".tmp"
     with open(tmp_file, "w") as file:
         json.dump(data, file, indent=4)
     os.replace(tmp_file, DATA_FILE)
+
+
+def _write_local_backup():
+    """Copy the data file into BACKUP_DIR and prune old backups (keeps BACKUP_KEEP most recent)."""
+    if not os.path.exists(DATA_FILE):
+        return
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"wg_data_alpha.{timestamp}.bak")
+    try:
+        shutil.copy2(DATA_FILE, dest)
+        logger.info("Local backup written: %s", dest)
+    except Exception as exc:
+        logger.warning("Failed to write local backup: %s", exc)
+        return
+    try:
+        baks = sorted(
+            (f for f in os.listdir(BACKUP_DIR) if f.endswith(".bak")),
+            reverse=True,
+        )
+        for old in baks[BACKUP_KEEP:]:
+            os.remove(os.path.join(BACKUP_DIR, old))
+    except Exception as exc:
+        logger.warning("Backup rotation failed: %s", exc)
+
+
+async def scheduled_local_backup(context: CallbackContext) -> None:
+    _write_local_backup()
 
 
 def _normalise_member_name(name: str) -> str:
@@ -3362,6 +3381,19 @@ def setup_chronicler_backup_job(application):
     )
 
 
+def setup_local_backup_job(application):
+    """Schedule twice-daily local backups at 04:00 and 16:00 Berlin time."""
+    tz = pytz.timezone("Europe/Berlin")
+    for hour in (4, 16):
+        application.job_queue.run_daily(
+            scheduled_local_backup,
+            time=datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0).timetz(),
+            name=f"local_backup_{hour:02d}h",
+        )
+    # Write one immediately on startup so there's always a fresh copy.
+    _write_local_backup()
+
+
 def setup_weekly_job(application, hour=9, minute=30):
     tz = pytz.timezone("Europe/Berlin")
     target_time = datetime.now(tz).replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -3827,6 +3859,7 @@ def main():
         name="weekly_report_catchup",
     )
     setup_chronicler_backup_job(app)
+    setup_local_backup_job(app)
 
     # Daily noon check for WG-Höck reminder
     tz = pytz.timezone("Europe/Berlin")
