@@ -240,17 +240,31 @@ def _format_signed_currency(amount: float) -> str:
 
 
 def _resolve_member_for_user(user):
-    if not user:
+    if not user or not user.id:
         return None
 
-    candidates = []
-    if user.id:
-        candidates.append(str(user.id))
+    uid = user.id
+    data = load_data()
+    members = data.get("members") or []
 
-    for candidate in candidates:
-        match = _match_member_UID(candidate)
-        if match:
-            return match
+    # Primary lookup: find member by stored uid field
+    for member in members:
+        if isinstance(member, dict) and member.get("uid") == uid:
+            return member
+
+    # Fallback: hardcoded UID map (bootstrap for members without uid stored yet)
+    match = _match_member_UID(str(uid))
+    if match:
+        matched_name = _get_member_name(match)
+        # Find the actual member in data and persist the uid
+        for member in members:
+            if isinstance(member, dict) and _normalise_member_name(member.get("name", "")) == _normalise_member_name(matched_name):
+                member["uid"] = uid
+                save_data(data)
+                return member
+        # Name from hardcoded map not in members list (shouldn't happen normally)
+        return match
+
     return None
 
 
@@ -2624,7 +2638,8 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^Change Username$"), start_change_username)],
         states={
             CHANGE_USERNAME_NEW: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, do_change_username)
+                MessageHandler(filters.Regex("^Cancel$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, do_change_username),
             ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, on_timeout)
@@ -2634,6 +2649,7 @@ def main():
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex("^Cancel$"), cancel),
         ],
+        allow_reentry=True,
         conversation_timeout=300,
     )
     app.add_handler(change_username_conv)
