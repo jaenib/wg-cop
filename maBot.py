@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     _openai_lib = None
 
+try:
+    from PIL import Image, ImageOps, ImageFilter
+except ImportError:  # pragma: no cover - optional dependency
+    Image = ImageOps = ImageFilter = None
+
 # Set up logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
@@ -573,6 +578,7 @@ def build_receipt_items_kb(items, selected):
 
 
 _LINE_ITEM_AMOUNT_RE = re.compile(r"(-?\d+[.,]\d{1,2})")
+_OCR_AMOUNT_RE = re.compile(r"(-?\d+[.,]\d{1,3})")
 _COLUMN_TOKEN_RE = re.compile(r"^-?\d+(?:[.,]\d+)?$")
 _HEADER_MARKERS = re.compile(r"\bartikel\b", re.IGNORECASE)
 _STOP_MARKERS = re.compile(r"\b(total|summe|gesamt)\b", re.IGNORECASE)
@@ -702,48 +708,289 @@ def _extract_receipt_total_from_text(text: str):
     return matches[-1] if matches else None
 
 
+def _parse_ocr_amount(token: str):
+    token = token.replace("O", "0").replace("o", "0")
+    matches = _OCR_AMOUNT_RE.findall(token)
+    if not matches:
+        return None
+    amount = matches[-1].replace(",", ".")
+    if "." in amount:
+        whole, frac = amount.split(".", 1)
+        frac = frac[:2]
+        try:
+            return round(float(f"{whole}.{frac}"), 2)
+        except ValueError:
+            return None
+    try:
+        return round(float(amount), 2)
+    except ValueError:
+        return None
+
+
+def _parse_receipt_tsv(tsv_text: str, image_width: int):
+    lines = {}
+    for raw_line in tsv_text.splitlines():
+        parts = raw_line.split("\t")
+        if len(parts) != 12 or parts[0] == "level":
+            continue
+        text = parts[11].strip()
+        if not text:
+            continue
+        key = (parts[2], parts[3], parts[4])
+        lines.setdefault(key, []).append(
+            {
+                "text": text,
+                "left": int(parts[6]),
+            }
+        )
+
+    items = []
+    receipt_total = None
+    for words in lines.values():
+        words.sort(key=lambda word: word["left"])
+        joined = " ".join(word["text"] for word in words)
+        upper = joined.upper()
+
+        if "OTAL" in upper or "CHF" in upper:
+            total_candidates = [
+                _parse_ocr_amount(word["text"])
+                for word in words
+                if word["left"] / image_width > 0.45
+            ]
+            total_candidates = [amount for amount in total_candidates if amount is not None]
+            if total_candidates:
+                receipt_total = max(total_candidates)
+            continue
+
+        amount = None
+        for word in words:
+            x_ratio = word["left"] / image_width
+            candidate = _parse_ocr_amount(word["text"])
+            if candidate is not None and x_ratio > 0.62:
+                amount = candidate
+        if amount is None:
+            continue
+
+        name_parts = []
+        for word in words:
+            x_ratio = word["left"] / image_width
+            text = word["text"]
+            if x_ratio < 0.46 and (
+                any(ch.isalpha() for ch in text)
+                or ("." in text and any(ch.isdigit() for ch in text))
+            ):
+                name_parts.append(text)
+
+        name = " ".join(name_parts).strip(" :-–—|/\\")
+        if len(name) < 2 or sum(ch.isalpha() for ch in name) < 2:
+            continue
+        items.append({"name": name, "amount": amount})
+
+    return items, receipt_total
+
+
+def _find_receipt_crop_box(gray_img):
+    width, height = gray_img.size
+    pixels = gray_img.load()
+    bright_threshold = 150
+
+    def row_ratio(y):
+        bright = 0
+        for x in range(width):
+            if pixels[x, y] >= bright_threshold:
+                bright += 1
+        return bright / width
+
+    def col_ratio(x, top, bottom):
+        span = max(bottom - top, 1)
+        bright = 0
+        for y in range(top, bottom):
+            if pixels[x, y] >= bright_threshold:
+                bright += 1
+        return bright / span
+
+    def find_band_forward(limit, getter, ratio_threshold, min_run):
+        run = 0
+        start = 0
+        for idx in range(limit):
+            if getter(idx) >= ratio_threshold:
+                if run == 0:
+                    start = idx
+                run += 1
+                if run >= min_run:
+                    return start
+            else:
+                run = 0
+        return None
+
+    def find_band_backward(limit, getter, ratio_threshold, min_run):
+        run = 0
+        end = limit - 1
+        for idx in range(limit - 1, -1, -1):
+            if getter(idx) >= ratio_threshold:
+                if run == 0:
+                    end = idx
+                run += 1
+                if run >= min_run:
+                    return end + 1
+            else:
+                run = 0
+        return None
+
+    top = find_band_forward(height, row_ratio, 0.28, 12)
+    bottom = find_band_backward(height, row_ratio, 0.28, 12)
+    if top is None or bottom is None or bottom <= top:
+        return None
+
+    left = find_band_forward(width, lambda x: col_ratio(x, top, bottom), 0.18, 8)
+    right = find_band_backward(width, lambda x: col_ratio(x, top, bottom), 0.18, 8)
+    if left is None or right is None or right <= left:
+        return None
+
+    margin_x = max(8, int(width * 0.015))
+    margin_top = max(8, int(height * 0.015))
+    margin_bottom = max(40, int((bottom - top) * 0.12))
+    left = max(0, left - margin_x)
+    right = min(width, right + margin_x)
+    top = max(0, top - margin_top)
+    bottom = min(height, bottom + margin_bottom)
+
+    if (right - left) * (bottom - top) < width * height * 0.30:
+        return None
+    return (left, top, right, bottom)
+
+
+def _build_receipt_ocr_candidates(image_path: str):
+    candidates = []
+    try:
+        with Image.open(image_path) as raw_img:
+            candidates.append((image_path, "raw", raw_img.width))
+    except Exception:
+        candidates.append((image_path, "raw", 0))
+    if Image is None:
+        return candidates
+
+    try:
+        with Image.open(image_path) as img:
+            gray = img.convert("L")
+            crop_box = _find_receipt_crop_box(gray)
+            if not crop_box:
+                return candidates
+
+            cropped = gray.crop(crop_box)
+            scale = 3
+            resized = cropped.resize(
+                (cropped.width * scale, cropped.height * scale),
+                Image.Resampling.LANCZOS,
+            )
+            enhanced = ImageOps.autocontrast(resized)
+            enhanced = enhanced.filter(ImageFilter.SHARPEN)
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            tmp_path = tmp.name
+            tmp.close()
+            enhanced.save(tmp_path)
+            logger.info("Local OCR preprocessed crop box: %s", crop_box)
+            candidates.insert(
+                0,
+                (
+                    tmp_path,
+                    f"cropped:{crop_box[0]},{crop_box[1]},{crop_box[2]},{crop_box[3]}",
+                    enhanced.width,
+                ),
+            )
+    except Exception as exc:
+        logger.warning("Local OCR preprocessing failed: %s", exc)
+
+    return candidates
+
+
 def _extract_items_from_receipt_tesseract(image_path: str):
     tesseract = shutil.which("tesseract")
     if not tesseract:
         return None
 
-    psm_modes = ("6", "4")
-    for psm in psm_modes:
-        try:
-            proc = subprocess.run(
-                [tesseract, image_path, "stdout", "-l", "deu+eng", "--psm", psm],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError as exc:
-            logger.warning("Local OCR failed to start: %s", exc)
-            return None
+    best = None
+    candidates = _build_receipt_ocr_candidates(image_path)
+    try:
+        for candidate_path, candidate_label, candidate_width in candidates:
+            for psm in ("6", "4"):
+                try:
+                    proc = subprocess.run(
+                        [tesseract, candidate_path, "stdout", "-l", "deu+eng", "--psm", psm],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                except OSError as exc:
+                    logger.warning("Local OCR failed to start: %s", exc)
+                    return None
 
-        if proc.returncode != 0:
-            logger.warning("Local OCR failed (psm=%s): %s", psm, proc.stderr.strip())
-            continue
+                if proc.returncode != 0:
+                    logger.warning(
+                        "Local OCR failed (%s, psm=%s): %s",
+                        candidate_label,
+                        psm,
+                        proc.stderr.strip(),
+                    )
+                    continue
 
-        ocr_text = proc.stdout or ""
-        logger.info("Local OCR text (psm=%s): %s", psm, ocr_text)
-        items = parse_receipt_text(ocr_text)
-        if not items:
-            continue
+                ocr_text = proc.stdout or ""
+                logger.info("Local OCR text (%s, psm=%s): %s", candidate_label, psm, ocr_text)
+                parser_results = []
+                plain_items = parse_receipt_text(ocr_text)
+                if plain_items:
+                    parser_results.append(
+                        ("plain", plain_items, _extract_receipt_total_from_text(ocr_text))
+                    )
 
-        receipt_total = _extract_receipt_total_from_text(ocr_text)
-        logger.info(
-            "Local OCR parsed %d items (psm=%s), items_sum=%.2f, receipt_total=%s",
-            len(items),
-            psm,
-            round(sum(item["amount"] for item in items), 2),
-            f"{receipt_total:.2f}" if receipt_total is not None else "None",
-        )
+                tsv_proc = subprocess.run(
+                    [tesseract, candidate_path, "stdout", "-l", "deu+eng", "--psm", psm, "tsv"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if tsv_proc.returncode == 0:
+                    parser_results.append(
+                        ("tsv", *_parse_receipt_tsv(tsv_proc.stdout or "", candidate_width))
+                    )
+
+                for parser_name, items, receipt_total in parser_results:
+                    if not items:
+                        continue
+                    items_sum = round(sum(item["amount"] for item in items), 2)
+                    mismatch = abs(items_sum - receipt_total) if receipt_total is not None else 0
+                    score = len(items) * 10 - mismatch
+                    if receipt_total is not None:
+                        score += 50
+                    logger.info(
+                        "Local OCR parsed %d items (%s, psm=%s, parser=%s), items_sum=%.2f, receipt_total=%s, score=%.2f",
+                        len(items),
+                        candidate_label,
+                        psm,
+                        parser_name,
+                        items_sum,
+                        f"{receipt_total:.2f}" if receipt_total is not None else "None",
+                        score,
+                    )
+                    if best is None or score > best["score"]:
+                        best = {
+                            "score": score,
+                            "items": items,
+                            "receipt_total": receipt_total,
+                            "description": _infer_receipt_description(ocr_text),
+                        }
+    finally:
+        for candidate_path, _, _ in candidates:
+            if candidate_path != image_path and os.path.exists(candidate_path):
+                os.remove(candidate_path)
+
+    if best:
         return {
-            "description": _infer_receipt_description(ocr_text),
-            "receipt_total": receipt_total,
-            "items": items,
+            "description": best["description"],
+            "receipt_total": best["receipt_total"],
+            "items": best["items"],
         }
-
     return None
 
 
