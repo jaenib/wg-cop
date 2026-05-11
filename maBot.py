@@ -532,8 +532,16 @@ def build_split_inline_kb(members, selected):
     return InlineKeyboardMarkup(rows)
 
 
-def build_receipt_items_text(items, selected):
-    total = sum(items[i]["amount"] for i in selected)
+def _receipt_shared_total(items, selected, confirmed_total=None):
+    all_sum = sum(item["amount"] for item in items)
+    selected_sum = sum(items[i]["amount"] for i in selected if i < len(items))
+    if confirmed_total and all_sum:
+        return round(confirmed_total * selected_sum / all_sum, 2)
+    return round(selected_sum, 2)
+
+
+def build_receipt_items_text(items, selected, confirmed_total=None):
+    total = _receipt_shared_total(items, selected, confirmed_total)
     return f"Tap items to exclude personal ones.\n\nShared total: CHF {total:.2f}"
 
 
@@ -696,8 +704,9 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
                             "- For weighted items (e.g. 0.275 kg) the Total column already shows the CHF amount charged; use it as-is\n"
                             "- For discounted items use the discounted/action price shown in the Total column, not the original price\n"
                             "- For multi-quantity items (e.g. Menge=2) the Total column already reflects the full line total; use it\n"
+                            "- If the same product name appears on multiple lines (e.g. Bauernspeck twice with different weights), list EACH line as a separate item — do not merge them\n"
                             "- Exclude header rows, subtotals, receipt totals, tax lines, and loyalty/points lines\n"
-                            "- Keep item names short but recognisable"
+                            "- Keep item names short but recognisable; append weight (e.g. '0.128kg') to disambiguate duplicate names"
                         ),
                     },
                 ],
@@ -973,21 +982,12 @@ async def expense_receipt_confirm_total(update: Update, context: CallbackContext
         return EXPENSE_RECEIPT_CONFIRM_TOTAL
 
     items = context.user_data.get("receipt_items", [])
-    parsed_total = context.user_data.get("receipt_parsed_total", 0)
-
-    if parsed_total and parsed_total != confirmed_total:
-        scale = confirmed_total / parsed_total
-        items = [
-            {"name": item["name"], "amount": round(item["amount"] * scale, 2)}
-            for item in items
-        ]
-        context.user_data["receipt_items"] = items
-
+    context.user_data["confirmed_total"] = confirmed_total
     context.user_data["amount"] = confirmed_total
     context.user_data["receipt_selected"] = set(range(len(items)))
 
     await update.message.reply_text(
-        build_receipt_items_text(items, context.user_data["receipt_selected"]),
+        build_receipt_items_text(items, context.user_data["receipt_selected"], confirmed_total),
         reply_markup=build_receipt_items_kb(items, context.user_data["receipt_selected"]),
     )
     return EXPENSE_RECEIPT_REVIEW
@@ -1045,13 +1045,15 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
         )
         return ConversationHandler.END
 
+    confirmed_total = context.user_data.get("confirmed_total")
+
     if query.data == CB_RECEIPT_DONE:
         if not selected:
             await query.answer("Select at least one item.", show_alert=True)
             return EXPENSE_RECEIPT_REVIEW
 
         chosen = [items[i] for i in sorted(selected)]
-        total = round(sum(item["amount"] for item in chosen), 2)
+        total = _receipt_shared_total(items, selected, confirmed_total)
         context.user_data["selected_items"] = chosen
         context.user_data["amount"] = total
 
@@ -1088,7 +1090,7 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
             context.user_data["receipt_selected"] = selected
 
         await query.edit_message_text(
-            build_receipt_items_text(items, selected),
+            build_receipt_items_text(items, selected, confirmed_total),
             reply_markup=build_receipt_items_kb(items, selected),
         )
         return EXPENSE_RECEIPT_REVIEW
