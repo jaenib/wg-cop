@@ -3358,7 +3358,6 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("expenses", list_expenses))
-    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("chore", handle_chore))
     app.add_handler(CommandHandler("chores", list_chores))
     app.add_handler(CommandHandler("setstatus", set_vacation_status))
@@ -3376,7 +3375,6 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), back_to_settings))
     app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
     app.add_handler(MessageHandler(filters.Regex("^Manage "), open_manage_self))
-    app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     admin_beer_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Adjust Beer Count$"), admin_beer_start)],
@@ -3632,6 +3630,13 @@ def main():
             pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel)$",
         )
     )
+
+    # Top-level cancel — registered LAST so each ConversationHandler's own
+    # fallback gets first shot at /cancel and can properly end the conversation.
+    # If we registered these earlier, they would swallow /cancel before the
+    # ConversationHandler ever sees it, leaving the user stuck in their state.
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
 
     _startup_data = load_data()
     _rh, _rm = _parse_report_time(_startup_data.get("weekly_report_time", "09:30"))
