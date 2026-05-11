@@ -98,6 +98,7 @@ def load_data():
             "members": [],
             "chronicler_backup": {"greeting_sent": False, "last_sent": None},
             "weekly_report_meta": {"last_sent": None},
+            "weekly_report_time": "09:30",
         }
         with open(DATA_FILE, "w") as file:
             json.dump(default_data, file, indent=4)
@@ -112,7 +113,9 @@ def load_data():
         data["chore_log"] = []
     if "weekly_report_meta" not in data:
         data["weekly_report_meta"] = {"last_sent": None}
-    
+    if "weekly_report_time" not in data:
+        data["weekly_report_time"] = "09:30"
+
     # Migrate members from strings to objects with status field
     if data.get("members"):
         needs_migration = False
@@ -346,6 +349,7 @@ EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
 ADMIN_BEER_MEMBER, ADMIN_BEER_COUNT = range(2)
 ADMIN_HOECK_DATE = 0  # single-state conv
+ADMIN_REPORT_TIME = 0  # single-state conv
 CHANGE_USERNAME_NEW = 0  # single-state conv
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
@@ -387,6 +391,7 @@ def get_admin_keyboard():
         [
             [KeyboardButton("Member Management")],
             [KeyboardButton("Set Weekly Report")],
+            [KeyboardButton("Set Report Time")],
             [KeyboardButton("Trigger Weekly Report")],
             [KeyboardButton("Adjust Beer Count")],
             [KeyboardButton("Set WG-Höck")],
@@ -2945,6 +2950,57 @@ async def admin_hoeck_date(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
+def _parse_report_time(time_str):
+    """Parse HH:MM string into (hour, minute) tuple, defaulting to (9, 30)."""
+    try:
+        h, m = time_str.strip().split(":")
+        return int(h), int(m)
+    except Exception:
+        return 9, 30
+
+
+async def admin_report_time_start(update: Update, context: CallbackContext) -> int:
+    if update.effective_user.id != BOT_HANDLER_ID:
+        await update.message.reply_text("Unauthorized.")
+        return ConversationHandler.END
+
+    data = load_data()
+    current = data.get("weekly_report_time", "09:30")
+    await update.message.reply_text(
+        f"Current weekly report time: {current} (Europe/Berlin)\n\n"
+        "Enter new time in HH:MM format (24h):",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Cancel")]], resize_keyboard=True),
+    )
+    return ADMIN_REPORT_TIME
+
+
+async def admin_report_time_set(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+    try:
+        h, m = text.split(":")
+        h, m = int(h), int(m)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text(
+            "Invalid format. Please use HH:MM (e.g. 09:30 or 18:00)."
+        )
+        return ADMIN_REPORT_TIME
+
+    time_str = f"{h:02d}:{m:02d}"
+    data = load_data()
+    data["weekly_report_time"] = time_str
+    save_data(data)
+
+    setup_weekly_job(context.application, hour=h, minute=m)
+
+    await update.message.reply_text(
+        f"Weekly report time set to {time_str} (Europe/Berlin, every Monday).",
+        reply_markup=get_admin_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def send_hoeck_reminder(context: CallbackContext) -> None:
     """Fires daily at noon CET. Sends reminder if today is WG-Höck day."""
     data = load_data()
@@ -2986,11 +3042,11 @@ def _get_weekly_report_meta(data):
     return data.setdefault("weekly_report_meta", {"last_sent": None})
 
 
-def _weekly_report_target_for_week(reference=None):
+def _weekly_report_target_for_week(reference=None, hour=9, minute=30):
     tz = pytz.timezone("Europe/Berlin")
     now = reference or datetime.now(tz)
     monday = now - timedelta(days=now.weekday())
-    return monday.replace(hour=9, minute=30, second=0, microsecond=0)
+    return monday.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
 def _parse_berlin_datetime(value):
@@ -3011,7 +3067,8 @@ def _parse_berlin_datetime(value):
 def _weekly_report_is_due(data, reference=None):
     tz = pytz.timezone("Europe/Berlin")
     now = reference or datetime.now(tz)
-    target = _weekly_report_target_for_week(now)
+    hour, minute = _parse_report_time(data.get("weekly_report_time", "09:30"))
+    target = _weekly_report_target_for_week(now, hour=hour, minute=minute)
     last_sent = _parse_berlin_datetime(_get_weekly_report_meta(data).get("last_sent"))
     return now >= target and (last_sent is None or last_sent < target)
 
@@ -3126,18 +3183,21 @@ def setup_chronicler_backup_job(application):
     )
 
 
-def setup_weekly_job(application):
-    target_time = datetime.now(pytz.timezone("Europe/Berlin"))
-    target_time = target_time.replace(hour=9, minute=30, second=0, microsecond=0)
+def setup_weekly_job(application, hour=9, minute=30):
+    tz = pytz.timezone("Europe/Berlin")
+    target_time = datetime.now(tz).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    if target_time.weekday() != 0 or datetime.now(pytz.timezone("Europe/Berlin")) > target_time:
+    if target_time.weekday() != 0 or datetime.now(tz) > target_time:
         days_until_monday = (7 - target_time.weekday()) % 7
         if days_until_monday == 0:
             days_until_monday = 7
         target_time = target_time + timedelta(days=days_until_monday)
 
-    current_time = datetime.now(pytz.timezone("Europe/Berlin"))
+    current_time = datetime.now(tz)
     seconds_until_target = (target_time - current_time).total_seconds()
+
+    for job in application.job_queue.get_jobs_by_name("weekly_penalty_check"):
+        job.schedule_removal()
 
     application.job_queue.run_repeating(
         check_weekly_penalties,
@@ -3357,6 +3417,23 @@ def main():
     )
     app.add_handler(admin_hoeck_conv)
 
+    admin_report_time_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^Set Report Time$"), admin_report_time_start)],
+        states={
+            ADMIN_REPORT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_report_time_set)],
+            ConversationHandler.TIMEOUT: [
+                MessageHandler(filters.ALL, on_timeout)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Cancel$"), cancel),
+        ],
+        allow_reentry=True,
+        conversation_timeout=300,
+    )
+    app.add_handler(admin_report_time_conv)
+
     expense_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Expense$"), start_expense)],
         states={
@@ -3545,7 +3622,9 @@ def main():
         )
     )
 
-    setup_weekly_job(app)
+    _startup_data = load_data()
+    _rh, _rm = _parse_report_time(_startup_data.get("weekly_report_time", "09:30"))
+    setup_weekly_job(app, hour=_rh, minute=_rm)
     app.job_queue.run_once(
         send_missed_weekly_report_on_startup,
         when=0,
