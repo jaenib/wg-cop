@@ -1,4 +1,7 @@
 # Ignore bot token and user data
+wg_data_alpha.json
+wg_data_alpha.json.tmp
+wg_data_alpha.json.*.bak
 wg_data_beta.json
 porter*
 *.pyc
