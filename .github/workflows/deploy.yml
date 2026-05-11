@@ -28,10 +28,12 @@ jobs:
             }
 
             cd /usr/bots/wg_cop
-            git config --global --add safe.directory /usr/bots/wg_cop
+            git config --global --get-all safe.directory | grep -Fxq /usr/bots/wg_cop || \
+              git config --global --add safe.directory /usr/bots/wg_cop
             git fetch origin main
-            git checkout main
-            git pull --ff-only origin main
+            git checkout -f main
+            git reset --hard origin/main
+            git clean -fd
 
             if ! command -v tesseract >/dev/null 2>&1; then
               run_priv env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
