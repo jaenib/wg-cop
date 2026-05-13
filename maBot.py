@@ -728,19 +728,10 @@ def build_split_inline_kb(members, selected):
     
     rows = []
 
-    all_names = [name for name, _ in active_members + vacating_members]
-    all_selected = all_names and all(
-        _normalise_member_name(n) in {_normalise_member_name(s) for s in selected}
-        for n in all_names
-    )
-    rows.append(
-        [InlineKeyboardButton(f"{'✅ ' if all_selected else ''}All", callback_data=CB_SPLIT_ALL)]
-    )
-
     # Add active members first
     for name, m in active_members:
         picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
-        label = f"{'✅ ' if picked else ''}{name}"
+        label = f"{name}{' ✅' if picked else ''}"
         rows.append(
             [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
         )
@@ -748,10 +739,19 @@ def build_split_inline_kb(members, selected):
     # Add vacating members (reminder not to forget them for long-term only)
     for name, m in vacating_members:
         picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
-        label = f"{'✅ ' if picked else ''}{name} (vacating)"
+        label = f"{name} (vacating){' ✅' if picked else ''}"
         rows.append(
             [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
         )
+
+    all_names = [name for name, _ in active_members + vacating_members]
+    all_selected = all_names and all(
+        _normalise_member_name(n) in {_normalise_member_name(s) for s in selected}
+        for n in all_names
+    )
+    rows.append(
+        [InlineKeyboardButton(f"All{' ✅' if all_selected else ''}", callback_data=CB_SPLIT_ALL)]
+    )
 
     rows.append(
         [
