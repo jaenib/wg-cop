@@ -336,6 +336,7 @@ class ReceiptParsingError(Exception):
 # Callback data prefixes
 CB_PAYER_PREFIX = "payer:"
 CB_SPLIT_TOGGLE_PREFIX = "split_toggle:"
+CB_SPLIT_ALL = "split_all"
 CB_SPLIT_DONE = "split_done"
 CB_SPLIT_BACK = "split_back"
 CB_SPLIT_CANCEL = "split_cancel"
@@ -726,25 +727,32 @@ def build_split_inline_kb(members, selected):
             active_members.append((name, m))
     
     rows = []
-    
+
+    all_names = [name for name, _ in active_members + vacating_members]
+    all_selected = all_names and all(
+        _normalise_member_name(n) in {_normalise_member_name(s) for s in selected}
+        for n in all_names
+    )
+    rows.append(
+        [InlineKeyboardButton(f"{'✅ ' if all_selected else ''}All", callback_data=CB_SPLIT_ALL)]
+    )
+
     # Add active members first
     for name, m in active_members:
         picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
-        prefix = "[x] " if picked else "[ ] "
-        label = f"{prefix}{name}"
+        label = f"{'✅ ' if picked else ''}{name}"
         rows.append(
             [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
         )
-    
-    # Add vacating members in italic (reminder not to forget them for long-term only)
+
+    # Add vacating members (reminder not to forget them for long-term only)
     for name, m in vacating_members:
         picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
-        prefix = "[x] " if picked else "[ ] "
-        label = f"{prefix}<i>{name} (vacating)</i>"
+        label = f"{'✅ ' if picked else ''}{name} (vacating)"
         rows.append(
-            [InlineKeyboardButton(f"{prefix}{name} (vacating)", callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
+            [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
         )
-    
+
     rows.append(
         [
             InlineKeyboardButton("Back", callback_data=CB_SPLIT_BACK),
@@ -1474,6 +1482,22 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
         )
         context.user_data.clear()
         return ConversationHandler.END
+
+    if query.data == CB_SPLIT_ALL:
+        all_names = {_get_member_name(m) for m in data["members"]}
+        sel = context.user_data.get("split_with", set())
+        if all_names and all(
+            _normalise_member_name(n) in {_normalise_member_name(s) for s in sel}
+            for n in all_names
+        ):
+            sel = set()
+        else:
+            sel = set(all_names)
+        context.user_data["split_with"] = sel
+        await query.edit_message_reply_markup(
+            reply_markup=build_split_inline_kb(data["members"], sel)
+        )
+        return EXPENSE_SPLIT
 
     if query.data.startswith(CB_SPLIT_TOGGLE_PREFIX):
         member = query.data[len(CB_SPLIT_TOGGLE_PREFIX) :]
@@ -3126,7 +3150,7 @@ def main():
             EXPENSE_SPLIT: [
                 CallbackQueryHandler(
                     expense_split_cb,
-                    pattern=r"^(?:split_toggle:.*|split_done|split_back|split_cancel)$",
+                    pattern=r"^(?:split_toggle:.*|split_all|split_done|split_back|split_cancel)$",
                 )
             ],
             ConversationHandler.TIMEOUT: [
