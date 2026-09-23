@@ -162,6 +162,8 @@ def member_by_mid(home: dict, mid: str):
 
 
 def member_for_uid(home: dict, uid):
+    if not is_user_id(uid):
+        return None
     for member in home.get("members") or []:
         if member.get("uid") == uid:
             return member
@@ -177,10 +179,12 @@ def member_by_name(home: dict, name):
 
 
 def is_admin(home: dict, uid) -> bool:
-    return uid in (home.get("roles") or {}).get("admins", [])
+    return is_user_id(uid) and uid in (home.get("roles") or {}).get("admins", [])
 
 
 def has_access(home: dict, uid) -> bool:
+    if not is_user_id(uid):
+        return False
     roles = home.get("roles") or {}
     if uid in roles.get("admins", []):
         return True
@@ -292,6 +296,9 @@ def migrate_legacy(old: dict, seed: dict | None = None, home_name: str = "WG") -
     missing = [k for k in LEGACY_REQUIRED_KEYS if k not in old]
     if missing:
         raise StoreError(f"Unrecognised legacy database (missing {', '.join(missing)}); migration refused")
+    for key, expected in (("members", list), ("expenses", list), ("chores", dict), ("penalties", dict)):
+        if not isinstance(old[key], expected):
+            raise StoreError(f"Legacy {key} must be a {expected.__name__}; migration refused")
 
     chat_id = numeric_id(old.get("group_chat_id")) or numeric_id(seed.get("group_chat_id"))
     if not is_group_id(chat_id):
@@ -375,8 +382,10 @@ class Store:
         return self.path.exists()
 
     def _load_raw(self):
+        def reject_constant(value):
+            raise ValueError(f"Non-finite JSON number: {value}")
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
+            return json.loads(self.path.read_text(encoding="utf-8"), parse_constant=reject_constant)
         except (ValueError, OSError) as exc:
             raise StoreError(f"Cannot read {self.path}: {exc}") from exc
 
@@ -414,7 +423,8 @@ class Store:
         env = migrate_legacy(old, seed, home_name=home_name)  # validated
         archive = self.path.with_name(self.path.name + LEGACY_ARCHIVE_SUFFIX)
         if not archive.exists():
-            with archive.open("xb") as fh:
+            fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
                 fh.write(self.path.read_bytes())
                 fh.flush()
                 os.fsync(fh.fileno())
