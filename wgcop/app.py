@@ -1,8 +1,8 @@
-"""Application wiring: handlers, conversations, jobs and the polling entry point."""
+"""Application wiring: store startup, handlers, conversations, jobs, polling entry point."""
 import logging
-from datetime import datetime, timedelta
+import re
+import sys
 
-import pytz
 from telegram import ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
@@ -15,18 +15,18 @@ from telegram.ext import (
     filters,
 )
 
-from wgcop.botconfig import TOKEN
+from wgcop.botconfig import TOKEN, legacy_seed
 from wgcop.handlers.admin import (
-    admin_beer_count,
-    admin_beer_member,
-    admin_beer_start,
     admin_hoeck_date,
     admin_hoeck_start,
+    admin_penalty_count,
+    admin_penalty_member,
+    admin_penalty_start,
     admin_report_time_set,
     admin_report_time_start,
     admin_system_overview,
+    admin_toggle_weekly,
     admin_trigger_report,
-    set_weekly_report,
 )
 from wgcop.handlers.chore import (
     chore_description,
@@ -66,6 +66,7 @@ from wgcop.handlers.expense import (
     receipt_items_cb,
     start_expense,
 )
+from wgcop.handlers.home import home_select_cb, join, join_cb, newhome, on_migrate, switch_home
 from wgcop.handlers.members import (
     do_change_username,
     manage_members,
@@ -74,20 +75,42 @@ from wgcop.handlers.members import (
     set_vacation_status,
     start_change_username,
 )
-from wgcop.handlers.penalties import beer_owed, redeem_count, redeem_member, redeem_start
+from wgcop.handlers.penalties import check_penalties, redeem_count, redeem_member, redeem_start
 from wgcop.handlers.views import list_expenses, standings
-from wgcop.jobs import (
-    send_alive,
-    send_hoeck_reminder,
-    send_missed_weekly_report_on_startup,
-    setup_chronicler_backup_job,
-    setup_local_backup_job,
-    setup_weekly_job,
-)
+from wgcop.homes import CB_HOME_SELECT, end_flow
+from wgcop.jobs import setup_jobs
 from wgcop.keyboards import (
-    ADMIN_BEER_COUNT,
-    ADMIN_BEER_MEMBER,
+    ADMIN_HOECK_DATE,
+    ADMIN_PENALTY_COUNT,
+    ADMIN_PENALTY_MEMBER,
     ADMIN_REPORT_TIME,
+    BTN_ADD_CHORE,
+    BTN_ADD_EXPENSE,
+    BTN_ADJUST_PENALTIES,
+    BTN_ADMIN_PANEL,
+    BTN_BACK_ADMIN,
+    BTN_BACK_MAIN,
+    BTN_BACK_SETTINGS,
+    BTN_CANCEL,
+    BTN_CHANGE_USERNAME,
+    BTN_CHECK_PENALTIES,
+    BTN_EDIT_ENTRIES,
+    BTN_LIST_CHORES,
+    BTN_LIST_EXPENSES,
+    BTN_MANAGE_PREFIX,
+    BTN_MANAGE_WEEKLY,
+    BTN_MEMBER_MANAGEMENT,
+    BTN_PENALTIES,
+    BTN_REDEEM_PENALTY,
+    BTN_SET_HOECK,
+    BTN_SET_REPORT_TIME,
+    BTN_SET_VACATION,
+    BTN_SETTINGS,
+    BTN_STANDINGS,
+    BTN_SWITCH_HOME,
+    BTN_SYSTEM_OVERVIEW,
+    BTN_TOGGLE_WEEKLY,
+    BTN_TRIGGER_WEEKLY,
     CB_PAYER_PREFIX,
     CHANGE_USERNAME_NEW,
     CHORE_DESCRIPTION,
@@ -104,334 +127,253 @@ from wgcop.keyboards import (
     EXPENSE_RECEIPT,
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_SPLIT,
+    JOIN_CALLBACK_PATTERN,
     MANAGE_MEMBER,
+    RECEIPT_CALLBACK_PATTERN,
     REDEEM_COUNT,
     REDEEM_MEMBER,
+    SPLIT_CALLBACK_PATTERN,
 )
-from wgcop.reports import _parse_report_time
-from wgcop.store import load_data
+from wgcop.store import StoreError, get_store
 
-# Set up logging (was at import time of maBot.py; kept at import time of the app module)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# httpx logs every request URL, which contains the bot token; keep it out of the journal.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 RECEIPT_IMAGE_FILTER = filters.PHOTO | filters.Document.IMAGE
+CONVERSATION_TIMEOUT = 300
+
+# Every menu button that starts something new. Pressing one of these (or sending
+# any command except /cancel) while a conversation is active ends that draft and
+# re-queues the update, so it is handled by the button's own handler instead of
+# being swallowed as free-text input by the stale conversation.
+NAV_LABELS = (
+    BTN_ADD_EXPENSE, BTN_ADD_CHORE, BTN_LIST_EXPENSES, BTN_LIST_CHORES, BTN_STANDINGS, BTN_PENALTIES,
+    BTN_SETTINGS, BTN_BACK_MAIN, BTN_BACK_SETTINGS, BTN_BACK_ADMIN, BTN_CHECK_PENALTIES,
+    BTN_REDEEM_PENALTY, BTN_SWITCH_HOME, BTN_ADMIN_PANEL, BTN_SET_VACATION, BTN_EDIT_ENTRIES,
+    BTN_CHANGE_USERNAME, BTN_MEMBER_MANAGEMENT, BTN_MANAGE_WEEKLY, BTN_ADJUST_PENALTIES, BTN_SET_HOECK,
+    BTN_SYSTEM_OVERVIEW, BTN_SET_REPORT_TIME, BTN_TOGGLE_WEEKLY, BTN_TRIGGER_WEEKLY,
+)
+NAV_FILTER = (
+    filters.Regex("^(" + "|".join(re.escape(label) for label in NAV_LABELS) + ")$")
+    | filters.Regex(f"^{re.escape(BTN_MANAGE_PREFIX)}")
+    | (filters.COMMAND & ~filters.Regex(r"^/cancel(@\w+)?(\s|$)"))
+)
 
 
-def main():
-    data = load_data()
-    persistence = PicklePersistence(filepath="bot_persistence.pkl")
-    app = Application.builder().token(TOKEN).persistence(persistence).build()
+def _conversation_handlers(app: Application):
+    return [h for h in app.handlers.get(0, []) if isinstance(h, ConversationHandler)]
 
+
+async def _end_conversation(conv: ConversationHandler, key) -> None:
+    """End one conversation for ``key`` and drop its pending timeout job.
+
+    Uses ConversationHandler internals (``_conversations``, ``_update_state``,
+    ``timeout_jobs``); python-telegram-bot is pinned in requirements.txt and
+    tests/test_wiring.py asserts these attributes exist.
+    """
+    if key in conv._conversations:
+        conv._update_state(ConversationHandler.END, key)
+    async with conv._timeout_jobs_lock:
+        job = conv.timeout_jobs.pop(key, None)
+    if job is not None:
+        job.schedule_removal()
+
+
+async def handoff(update: Update, context: CallbackContext):
+    """A menu button or command arrived mid-conversation.
+
+    End every active conversation of this chat+user, clear the draft, and run
+    the update again from the top so the button's real handler (or another
+    conversation's entry point) handles it now, in-process. If the very same
+    conversation was restarted by its own entry point, keep that new state.
+    """
+    app = context.application
+    if update.effective_chat:
+        end_flow(context, update.effective_chat.id)
+    active = []
+    for conv in _conversation_handlers(app):
+        try:
+            key = conv._get_key(update)
+        except Exception:  # pragma: no cover - defensive against exotic updates
+            continue
+        if key in conv._conversations:
+            active.append((conv, key))
+        await _end_conversation(conv, key)
+    await app.process_update(update)
+    if any(key in conv._conversations for conv, key in active):
+        return None  # restarted: leave the fresh state untouched
+    return ConversationHandler.END
+
+
+def _exact(label: str):
+    return filters.Regex(f"^{re.escape(label)}$")
+
+
+def _conversation(entry_label, states, *, allow_reentry=False, entry_filter=None):
+    nav = MessageHandler(NAV_FILTER, handoff)
+    guarded = {state: [nav, *handlers] for state, handlers in states.items() if state != "__entry__"}
+    timeout_state = {ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, on_timeout)]}
+    return ConversationHandler(
+        entry_points=[MessageHandler(entry_filter or _exact(entry_label), states["__entry__"])],
+        states={**guarded, **timeout_state},
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(_exact(BTN_CANCEL), cancel)],
+        allow_reentry=allow_reentry,
+        conversation_timeout=CONVERSATION_TIMEOUT,
+    )
+
+
+def _text_steps(*handlers, cancel_first=True):
+    steps = [MessageHandler(_exact(BTN_CANCEL), cancel)] if cancel_first else []
+    steps += [MessageHandler(filters.TEXT & ~filters.COMMAND, h) for h in handlers]
+    return steps
+
+
+def register_handlers(app: Application) -> None:
+    # Conversations come first: while one is active it must see every update for
+    # its chat+user, so a menu button pressed mid-draft reaches `handoff` instead
+    # of a plain handler that would leave the stale conversation running.
+    _register_conversations(app)
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("newhome", newhome))
+    app.add_handler(CommandHandler("join", join))
     app.add_handler(CommandHandler("expenses", list_expenses))
     app.add_handler(CommandHandler("chore", handle_chore))
     app.add_handler(CommandHandler("chores", list_chores))
     app.add_handler(CommandHandler("setstatus", set_vacation_status))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
 
-    app.add_handler(MessageHandler(filters.Regex("^Standings$"), standings))
-    app.add_handler(MessageHandler(filters.Regex("^List Expenses$"), list_expenses))
-    app.add_handler(MessageHandler(filters.Regex("^List Chores$"), list_chores))
-    app.add_handler(MessageHandler(filters.Regex("^Penalties$"), open_penalties))
-    app.add_handler(MessageHandler(filters.Regex("^Check Beer Owed$"), beer_owed))
-    app.add_handler(MessageHandler(filters.Regex("^Set Weekly Report$"), set_weekly_report))
-    app.add_handler(MessageHandler(filters.Regex("^Set Vacation Status$"), set_vacation_status))
-    app.add_handler(MessageHandler(filters.Regex("^Settings$"), open_settings))
-    app.add_handler(MessageHandler(filters.Regex("^Back to Main Menu$"), settings_back))
-    app.add_handler(MessageHandler(filters.Regex("^Admin Panel$"), open_admin_menu))
-    app.add_handler(MessageHandler(filters.Regex("^Back to Settings$"), back_to_settings))
-    app.add_handler(MessageHandler(filters.Regex("^Back to Admin$"), back_to_admin))
-    app.add_handler(MessageHandler(filters.Regex("^System Overview$"), admin_system_overview))
-    app.add_handler(MessageHandler(filters.Regex("^Trigger Weekly Report$"), admin_trigger_report))
-    app.add_handler(MessageHandler(filters.Regex("^Manage Weekly Report$"), open_weekly_report_menu))
-    app.add_handler(MessageHandler(filters.Regex("^Manage "), open_manage_self))
+    # Plain menu buttons
+    app.add_handler(MessageHandler(_exact(BTN_STANDINGS), standings))
+    app.add_handler(MessageHandler(_exact(BTN_LIST_EXPENSES), list_expenses))
+    app.add_handler(MessageHandler(_exact(BTN_LIST_CHORES), list_chores))
+    app.add_handler(MessageHandler(_exact(BTN_PENALTIES), open_penalties))
+    app.add_handler(MessageHandler(_exact(BTN_CHECK_PENALTIES), check_penalties))
+    app.add_handler(MessageHandler(_exact(BTN_SET_VACATION), set_vacation_status))
+    app.add_handler(MessageHandler(_exact(BTN_SETTINGS), open_settings))
+    app.add_handler(MessageHandler(_exact(BTN_SWITCH_HOME), switch_home))
+    app.add_handler(MessageHandler(_exact(BTN_BACK_MAIN), settings_back))
+    app.add_handler(MessageHandler(_exact(BTN_ADMIN_PANEL), open_admin_menu))
+    app.add_handler(MessageHandler(_exact(BTN_BACK_SETTINGS), back_to_settings))
+    app.add_handler(MessageHandler(_exact(BTN_BACK_ADMIN), back_to_admin))
+    app.add_handler(MessageHandler(_exact(BTN_SYSTEM_OVERVIEW), admin_system_overview))
+    app.add_handler(MessageHandler(_exact(BTN_TRIGGER_WEEKLY), admin_trigger_report))
+    app.add_handler(MessageHandler(_exact(BTN_TOGGLE_WEEKLY), admin_toggle_weekly))
+    app.add_handler(MessageHandler(_exact(BTN_MANAGE_WEEKLY), open_weekly_report_menu))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_MANAGE_PREFIX)}"), open_manage_self))
 
-    admin_beer_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Adjust Beer Count$"), admin_beer_start)],
-        states={
-            ADMIN_BEER_MEMBER: [
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_member)
-            ],
-            ADMIN_BEER_COUNT: [
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_beer_count)
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        allow_reentry=True,
-        conversation_timeout=300,
-    )
-    app.add_handler(admin_beer_conv)
+    # Inline callbacks outside conversations
+    app.add_handler(CallbackQueryHandler(home_select_cb, pattern=f"^{re.escape(CB_HOME_SELECT)}"))
+    app.add_handler(CallbackQueryHandler(join_cb, pattern=JOIN_CALLBACK_PATTERN))
 
-    admin_hoeck_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^Set WG-Höck$"), admin_hoeck_start)],
-        states={
-            0: [
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_hoeck_date),
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        allow_reentry=True,
-        conversation_timeout=300,
-    )
-    app.add_handler(admin_hoeck_conv)
-
-    admin_report_time_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Set Report Time$"), admin_report_time_start)],
-        states={
-            ADMIN_REPORT_TIME: [
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_report_time_set),
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        allow_reentry=True,
-        conversation_timeout=300,
-    )
-    app.add_handler(admin_report_time_conv)
-
-    expense_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Add Expense$"), start_expense)],
-        states={
-            EXPENSE_MODE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_mode_selection)
-            ],
-            EXPENSE_DESCRIPTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_description)
-            ],
-            EXPENSE_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_amount)
-            ],
-            EXPENSE_RECEIPT: [
-                MessageHandler(RECEIPT_IMAGE_FILTER, expense_receipt_photo),
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_invalid),
-            ],
-            EXPENSE_RECEIPT_REVIEW: [
-                CallbackQueryHandler(
-                    receipt_items_cb,
-                    pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel|receipt_accept|receipt_manual)$",
-                )
-            ],
-            EXPENSE_PAYER: [
-                CallbackQueryHandler(expense_payer_cb, pattern=f"^{CB_PAYER_PREFIX}")
-            ],
-            EXPENSE_SPLIT: [
-                CallbackQueryHandler(
-                    expense_split_cb,
-                    pattern=r"^(?:split_toggle:.*|split_all|split_done|split_back|split_cancel)$",
-                )
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        conversation_timeout=300,
-    )
-    app.add_handler(expense_conv)
-
-    manage_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Member Management$"), manage_members)],
-        states={
-            MANAGE_MEMBER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, modify_members)
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        conversation_timeout=300,
-    )
-    app.add_handler(manage_conv)
-
-    change_username_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Change Username$"), start_change_username)],
-        states={
-            CHANGE_USERNAME_NEW: [
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, do_change_username),
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        allow_reentry=True,
-        conversation_timeout=300,
-    )
-    app.add_handler(change_username_conv)
-
-    edit_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Edit Entries$"), start_edit_entries)],
-        states={
-            EDIT_PICK_MEMBER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_pick_member)
-            ],
-            EDIT_MENU: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_menu)
-            ],
-            EDIT_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_amount)
-            ],
-            EDIT_SPLIT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_entries_split)
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        conversation_timeout=300,
-    )
-    app.add_handler(edit_conv)
-
-    _nav_pattern = filters.Regex(
-        "^(Penalties|Check Beer Owed|Back to Main Menu|Settings|"
-        "Add Expense|Add Chore|Standings|List Expenses|List Chores|"
-        "Manage Members)$"
-    )
-    redeem_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Redeem Beer$"), redeem_start)],
-        states={
-            REDEEM_MEMBER: [
-                MessageHandler(_nav_pattern, cancel),
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_member),
-            ],
-            REDEEM_COUNT: [
-                MessageHandler(_nav_pattern, cancel),
-                MessageHandler(filters.Regex("^Cancel$"), cancel),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, redeem_count),
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        allow_reentry=True,
-        conversation_timeout=300,
-    )
-    app.add_handler(redeem_conv)
-
-    chore_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Add Chore$"), start_chore)],
-        states={
-            CHORE_USER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, chore_user)
-            ],
-            CHORE_MINUTES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, chore_minutes)
-            ],
-            CHORE_DESCRIPTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, chore_description)
-            ],
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, on_timeout)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^Cancel$"), cancel),
-        ],
-        conversation_timeout=300,
-    )
-
-    app.add_handler(chore_conv)
-
-    # Catch stale receipt inline-keyboard callbacks (e.g. after a bot restart)
-    async def _stale_receipt_cb(update: Update, context: CallbackContext) -> None:
+    # Stale inline keyboards (after a restart or a finished draft)
+    async def _stale_cb(update: Update, context: CallbackContext) -> None:
         query = update.callback_query
         await query.answer()
         await query.message.reply_text(
-            "This receipt session has expired (the bot may have restarted).\n"
-            "Please start a new expense via Add Expense → Scan Receipt.",
+            "This keyboard has expired (the draft ended or the bot restarted). Please start again from the main menu.",
             reply_markup=ReplyKeyboardRemove(),
         )
 
-    app.add_handler(
-        CallbackQueryHandler(
-            _stale_receipt_cb,
-            pattern=r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel)$",
-        )
-    )
+    app.add_handler(CallbackQueryHandler(_stale_cb, pattern=RECEIPT_CALLBACK_PATTERN))
+    app.add_handler(CallbackQueryHandler(_stale_cb, pattern=SPLIT_CALLBACK_PATTERN))
+    app.add_handler(CallbackQueryHandler(_stale_cb, pattern=f"^{CB_PAYER_PREFIX}"))
 
-    # Top-level cancel — registered LAST so each ConversationHandler's own
-    # fallback gets first shot at /cancel and can properly end the conversation.
-    # If we registered these earlier, they would swallow /cancel before the
-    # ConversationHandler ever sees it, leaving the user stuck in their state.
+    # Top-level cancel — registered LAST so each ConversationHandler's own fallback
+    # gets first shot at /cancel and can properly end the conversation.
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(MessageHandler(filters.Regex("^Cancel$"), cancel))
+    app.add_handler(MessageHandler(_exact(BTN_CANCEL), cancel))
 
-    _startup_data = load_data()
-    _rh, _rm = _parse_report_time(_startup_data.get("weekly_report_time", "09:30"))
-    setup_weekly_job(app, hour=_rh, minute=_rm)
-    app.job_queue.run_once(
-        send_missed_weekly_report_on_startup,
-        when=0,
-        name="weekly_report_catchup",
-    )
-    setup_chronicler_backup_job(app)
-    setup_local_backup_job(app)
 
-    # Daily noon check for WG-Höck reminder
-    tz = pytz.timezone("Europe/Berlin")
-    now = datetime.now(tz)
-    noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
-    if now >= noon_today:
-        noon_today += timedelta(days=1)
-    seconds_until_noon = (noon_today - now).total_seconds()
-    app.job_queue.run_repeating(
-        send_hoeck_reminder,
-        interval=timedelta(days=1).total_seconds(),
-        first=seconds_until_noon,
-        name="hoeck_reminder",
-    )
-    logger.info(f"Höck reminder scheduled, next check at {noon_today.strftime('%Y-%m-%d %H:%M')}")
+def _register_conversations(app: Application) -> None:
+    app.add_handler(_conversation(BTN_ADJUST_PENALTIES, {
+        "__entry__": admin_penalty_start,
+        ADMIN_PENALTY_MEMBER: _text_steps(admin_penalty_member),
+        ADMIN_PENALTY_COUNT: _text_steps(admin_penalty_count),
+    }, allow_reentry=True))
 
-    app.job_queue.run_repeating(
-        send_alive,
-        interval=timedelta(hours=50).total_seconds(),
-        first=0,
-        name="heartbeat",
-    )
+    app.add_handler(_conversation(BTN_SET_HOECK, {
+        "__entry__": admin_hoeck_start,
+        ADMIN_HOECK_DATE: _text_steps(admin_hoeck_date),
+    }, allow_reentry=True))
+
+    app.add_handler(_conversation(BTN_SET_REPORT_TIME, {
+        "__entry__": admin_report_time_start,
+        ADMIN_REPORT_TIME: _text_steps(admin_report_time_set),
+    }, allow_reentry=True))
+
+    app.add_handler(_conversation(BTN_ADD_EXPENSE, {
+        "__entry__": start_expense,
+        EXPENSE_MODE: _text_steps(expense_mode_selection, cancel_first=False),
+        EXPENSE_DESCRIPTION: _text_steps(expense_description, cancel_first=False),
+        EXPENSE_AMOUNT: _text_steps(expense_amount, cancel_first=False),
+        EXPENSE_RECEIPT: [
+            MessageHandler(RECEIPT_IMAGE_FILTER, expense_receipt_photo),
+            MessageHandler(_exact(BTN_CANCEL), cancel),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, expense_receipt_invalid),
+        ],
+        EXPENSE_RECEIPT_REVIEW: [CallbackQueryHandler(receipt_items_cb, pattern=RECEIPT_CALLBACK_PATTERN)],
+        EXPENSE_PAYER: [CallbackQueryHandler(expense_payer_cb, pattern=f"^{CB_PAYER_PREFIX}")],
+        EXPENSE_SPLIT: [CallbackQueryHandler(expense_split_cb, pattern=SPLIT_CALLBACK_PATTERN)],
+    }))
+
+    app.add_handler(_conversation(BTN_MEMBER_MANAGEMENT, {
+        "__entry__": manage_members,
+        MANAGE_MEMBER: _text_steps(modify_members, cancel_first=False),
+    }))
+
+    app.add_handler(_conversation(BTN_CHANGE_USERNAME, {
+        "__entry__": start_change_username,
+        CHANGE_USERNAME_NEW: _text_steps(do_change_username),
+    }, allow_reentry=True))
+
+    app.add_handler(_conversation(BTN_EDIT_ENTRIES, {
+        "__entry__": start_edit_entries,
+        EDIT_PICK_MEMBER: _text_steps(edit_entries_pick_member, cancel_first=False),
+        EDIT_MENU: _text_steps(edit_entries_menu, cancel_first=False),
+        EDIT_AMOUNT: _text_steps(edit_entries_amount, cancel_first=False),
+        EDIT_SPLIT: _text_steps(edit_entries_split, cancel_first=False),
+    }))
+
+    app.add_handler(_conversation(BTN_REDEEM_PENALTY, {
+        "__entry__": redeem_start,
+        REDEEM_MEMBER: _text_steps(redeem_member),
+        REDEEM_COUNT: _text_steps(redeem_count),
+    }, allow_reentry=True))
+
+    app.add_handler(_conversation(BTN_ADD_CHORE, {
+        "__entry__": start_chore,
+        CHORE_USER: _text_steps(chore_user, cancel_first=False),
+        CHORE_MINUTES: _text_steps(chore_minutes, cancel_first=False),
+        CHORE_DESCRIPTION: _text_steps(chore_description, cancel_first=False),
+    }))
+
+
+def build_application() -> Application:
+    store = get_store()
+    try:
+        outcome = store.initialize(legacy_seed())
+    except StoreError as exc:
+        logger.critical("Refusing to start: %s", exc)
+        raise SystemExit(2) from exc
+    logger.info("Store %s: %s (%d home(s))", store.path, outcome, len(store.list_homes()))
+
+    persistence = PicklePersistence(filepath="bot_persistence.pkl")
+    app = Application.builder().token(TOKEN).persistence(persistence).build()
+    register_handlers(app)
+    setup_jobs(app)
+    return app
+
+
+def main():
+    app = build_application()
     logger.info("Bot running...")
     app.run_polling()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

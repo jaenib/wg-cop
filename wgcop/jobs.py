@@ -1,7 +1,25 @@
-"""Scheduled jobs: weekly report, Höck reminder, chronicler + local backups, heartbeat."""
+"""Scheduled work, data-driven per home.
+
+One ``sweep`` job runs every minute and, for every home, performs whatever is
+due according to that home's stored settings and metadata:
+
+* weekly report: generate once per week (penalties applied inside
+  ``Store.update``), then deliver the pending text to the home's group with
+  exponential retry;
+* WG-Höck reminder at noon local time on the configured date;
+* chronicler export (that home only) on first assignment and weekly after;
+* heartbeat to the home's ``handler`` every 50 hours.
+
+Every step re-reads its home from the store right before acting, re-checks
+that the recipient still holds the role after each awaited send, and only
+then records delivery metadata. Nothing here needs rescheduling when a setting
+changes in Telegram. The twice-daily local backup copies the whole data file.
+"""
 import logging
 import os
+import re
 import shutil
+import tempfile
 import time
 from datetime import datetime, timedelta
 from random import randint
@@ -10,37 +28,72 @@ import pytz
 from telegram.error import TelegramError
 from telegram.ext import CallbackContext
 
-from wgcop.botconfig import (
-    BACKUP_DIR,
-    BACKUP_KEEP,
-    BOT_HANDLER_ID,
-    DATA_FILE,
-    GROUP_CHAT_ID,
-    _get_chronicler_chat_id,
+from wgcop.botconfig import BACKUP_DIR, BACKUP_KEEP, DATA_FILE
+from wgcop.homes import home_tz
+from wgcop.reports import (
+    _get_chronicler_meta,
+    _get_weekly_report_meta,
+    _parse_local_datetime,
+    _weekly_report_is_due,
+    generate_weekly_report,
 )
-from wgcop.reports import _get_chronicler_meta, _send_weekly_report, _weekly_report_is_due
-from wgcop.store import load_data, save_data
+from wgcop.store import HomeNotFound, StoreError, get_store
 
 logger = logging.getLogger(__name__)
 
+SWEEP_INTERVAL_SECONDS = 60
+HEARTBEAT_INTERVAL = timedelta(hours=50)
+CHRONICLER_INTERVAL = timedelta(days=7)
+HOECK_HOUR = 12
+MAX_RETRY_MINUTES = 60
+XKCD_MAX = 3163
+BACKUP_STAMP = re.compile(r"\.\d{8}-\d{6}\.bak$")
+
+
+def _xkcd() -> str:
+    return f"https://xkcd.com/{randint(1, XKCD_MAX)}/"
+
+
+def _elapsed(last_iso, now, tz) -> timedelta | None:
+    last = _parse_local_datetime(last_iso, tz)
+    return None if last is None else now - last
+
+
+def _fresh(home_id):
+    """Latest copy of the home, or None if it vanished meanwhile."""
+    try:
+        return get_store().get_home(home_id)
+    except HomeNotFound:
+        return None
+
+
+# ------------------------------------------------------------ local backup
 def _write_local_backup():
-    """Copy the data file into BACKUP_DIR and prune old backups (keeps BACKUP_KEEP most recent)."""
+    """Copy the data file into BACKUP_DIR (mode 0600) and prune old backups.
+
+    Only files matching ``<basename>.YYYYMMDD-HHMMSS.bak`` are rotated; the
+    migration archive and anything else sharing the prefix are left alone.
+    """
     if not os.path.exists(DATA_FILE):
         return
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Backup directory %s unavailable: %s", BACKUP_DIR, exc)
+        return
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(BACKUP_DIR, f"wg_data_alpha.{timestamp}.bak")
+    base = os.path.basename(DATA_FILE)
+    dest = os.path.join(BACKUP_DIR, f"{base}.{timestamp}.bak")
     try:
         shutil.copy2(DATA_FILE, dest)
+        os.chmod(dest, 0o600)
         logger.info("Local backup written: %s", dest)
     except Exception as exc:
         logger.warning("Failed to write local backup: %s", exc)
         return
     try:
-        baks = sorted(
-            (f for f in os.listdir(BACKUP_DIR) if f.endswith(".bak")),
-            reverse=True,
-        )
+        pattern = re.compile(r"^" + re.escape(base) + r"\.\d{8}-\d{6}\.bak$")
+        baks = sorted((f for f in os.listdir(BACKUP_DIR) if pattern.match(f)), reverse=True)
         for old in baks[BACKUP_KEEP:]:
             os.remove(os.path.join(BACKUP_DIR, old))
     except Exception as exc:
@@ -51,139 +104,240 @@ async def scheduled_local_backup(context: CallbackContext) -> None:
     _write_local_backup()
 
 
-async def check_weekly_penalties(context: CallbackContext) -> None:
-    data = load_data()
-    await _send_weekly_report(context, data)
+# --------------------------------------------------------- weekly report
+def _retry_due(meta, now, tz) -> bool:
+    next_try = _parse_local_datetime(meta.get("next_try"), tz)
+    return next_try is None or now >= next_try
 
 
-async def send_missed_weekly_report_on_startup(context: CallbackContext) -> None:
-    data = load_data()
-    if not _weekly_report_is_due(data):
-        return
+async def weekly_report_step(context, home, now=None) -> str | None:
+    """Generate if due, then try to deliver any pending text. Returns delivered text."""
+    store = get_store()
+    tz = home_tz(home)
+    now = now or datetime.now(tz)
+    hid = home["id"]
+    settings = home.get("settings") or {}
 
-    logger.info(
-        "Weekly report was missed at the scheduled time; sending catch-up report on startup"
-    )
-    await _send_weekly_report(context, data)
+    if settings.get("weekly_report_enabled", True) and _weekly_report_is_due(home, now):
+        home, _ = store.update(hid, lambda h: generate_weekly_report(h, now))
+        logger.info("Home %s: weekly report generated", hid)
 
+    meta = _get_weekly_report_meta(home)
+    pending = meta.get("pending")
+    if not pending or not _retry_due(meta, now, tz):
+        return None
 
-async def send_hoeck_reminder(context: CallbackContext) -> None:
-    """Fires daily at noon CET. Sends reminder if today is WG-Höck day."""
-    data = load_data()
-    hoeck_date_str = data.get("wg_hoeck_date")
-    if not hoeck_date_str:
-        return
-
-    tz = pytz.timezone("Europe/Berlin")
-    today = datetime.now(tz).date()
     try:
-        hoeck_date = datetime.strptime(hoeck_date_str, "%Y-%m-%d").date()
+        await context.bot.send_message(chat_id=home["group_chat_id"], text=pending)
+    except TelegramError as exc:
+        logger.error("Home %s: weekly report delivery failed: %s", hid, exc)
+
+        def backoff(h):
+            m = _get_weekly_report_meta(h)
+            attempts = int(m.get("attempts") or 0) + 1
+            m["attempts"] = attempts
+            m["next_try"] = (now + timedelta(minutes=min(2 ** attempts, MAX_RETRY_MINUTES))).isoformat()
+
+        store.update(hid, backoff)
+        return None
+
+    def delivered(h):
+        m = _get_weekly_report_meta(h)
+        if m.get("pending") != pending:
+            return  # a newer report was generated meanwhile; leave it pending
+        m["pending"] = None
+        m["pending_since"] = None
+        m["attempts"] = 0
+        m["next_try"] = None
+        m["delivered_at"] = now.isoformat()
+
+    store.update(hid, delivered)
+    logger.info("Home %s: weekly report delivered", hid)
+    return pending
+
+
+# --------------------------------------------------------- hoeck reminder
+async def hoeck_step(context, home, now=None) -> bool:
+    tz = home_tz(home)
+    now = now or datetime.now(tz)
+    date_str = (home.get("settings") or {}).get("wg_hoeck_date")
+    if not date_str:
+        return False
+    try:
+        hoeck_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
-        return
+        return False
+    if now.date() != hoeck_date or now.hour < HOECK_HOUR:
+        return False
+    if (home.get("hoeck_meta") or {}).get("reminded_for") == date_str:
+        return False
+    try:
+        await context.bot.send_message(chat_id=home["group_chat_id"], text="📅 Reminder: WG-Höck is today! Be there.")
+    except TelegramError as exc:
+        logger.error("Home %s: failed to send Höck reminder: %s", home["id"], exc)
+        return False
 
-    if today != hoeck_date:
-        return
+    def mark(h):
+        h.setdefault("hoeck_meta", {})["reminded_for"] = date_str
 
-    group_id = data.get("group_chat_id")
-    if not group_id:
-        group_id = GROUP_CHAT_ID
+    get_store().update(home["id"], mark)
+    return True
 
+
+# ------------------------------------------------------------- chronicler
+async def _send_home_export(context, home, chat_id, caption) -> None:
+    payload = get_store().export_home(home["id"])
+    safe_name = "".join(c if c.isalnum() else "_" for c in home.get("name", "home"))[:40] or "home"
+    filename = f"wg_{safe_name}_{datetime.now(pytz.UTC).strftime('%Y%m%d')}.json"
+    with tempfile.NamedTemporaryFile("w+", suffix=".json", encoding="utf-8", delete=False) as fh:
+        fh.write(payload)
+        tmp_path = fh.name
+    try:
+        with open(tmp_path, "rb") as doc:
+            await context.bot.send_document(chat_id=chat_id, document=doc, filename=filename, caption=caption)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _still_chronicler(home_id, uid):
+    fresh = _fresh(home_id)
+    return fresh if fresh is not None and (fresh.get("roles") or {}).get("chronicler") == uid else None
+
+
+async def chronicler_step(context, home, now=None) -> str | None:
+    """Returns 'initial' | 'weekly' | None. Re-checks the role around every send."""
+    hid = home["id"]
+    chronicler = (home.get("roles") or {}).get("chronicler")
+    if not chronicler:
+        return None
+    tz = home_tz(home)
+    now = now or datetime.now(tz)
+    meta = _get_chronicler_meta(home)
+    is_new_holder = meta.get("uid") not in (None, chronicler)
+
+    if not meta.get("greeting_sent") or is_new_holder:
+        try:
+            await context.bot.send_message(
+                chat_id=chronicler,
+                text=(
+                    f"Greetings, Chronicler! You have been entrusted with safeguarding the history of "
+                    f"'{home.get('name')}'. Here is the first archive snapshot for your special role."
+                ),
+            )
+            fresh = _still_chronicler(hid, chronicler)
+            if fresh is None:
+                logger.info("Home %s: chronicler changed during greeting; export withheld", hid)
+                return None
+            await _send_home_export(context, fresh, chronicler, "Initial archive dispatch")
+        except TelegramError as exc:
+            logger.error("Home %s: failed to deliver initial chronicler backup: %s", hid, exc)
+            return None
+
+        def mark_initial(h):
+            if (h.get("roles") or {}).get("chronicler") != chronicler:
+                return
+            m = _get_chronicler_meta(h)
+            m["greeting_sent"] = True
+            m["last_sent"] = now.isoformat()
+            m["uid"] = chronicler
+
+        get_store().update(hid, mark_initial)
+        return "initial"
+
+    elapsed = _elapsed(meta.get("last_sent"), now, tz)
+    if elapsed is not None and elapsed < CHRONICLER_INTERVAL:
+        return None
+    fresh = _still_chronicler(hid, chronicler)
+    if fresh is None:
+        return None
+    try:
+        await _send_home_export(context, fresh, chronicler, "Weekly archive backup and an xkcd for your troubles")
+        await context.bot.send_message(chat_id=chronicler, text=_xkcd())
+    except TelegramError as exc:
+        logger.error("Home %s: failed to send chronicler backup: %s", hid, exc)
+        return None
+
+    def mark_weekly(h):
+        if (h.get("roles") or {}).get("chronicler") != chronicler:
+            return
+        m = _get_chronicler_meta(h)
+        m["last_sent"] = now.isoformat()
+        m["uid"] = chronicler
+
+    get_store().update(hid, mark_weekly)
+    return "weekly"
+
+
+# -------------------------------------------------------------- heartbeat
+async def heartbeat_step(context, home, now=None) -> bool:
+    hid = home["id"]
+    handler = (home.get("roles") or {}).get("handler")
+    if not handler:
+        return False
+    tz = home_tz(home)
+    now = now or datetime.now(tz)
+    meta = home.get("heartbeat") or {}
+    if meta.get("uid") in (None, handler):
+        elapsed = _elapsed(meta.get("last_sent"), now, tz)
+        if elapsed is not None and elapsed < HEARTBEAT_INTERVAL:
+            return False
     try:
         await context.bot.send_message(
-            chat_id=group_id,
-            text="📅 Reminder: WG-Höck is today! Be there.",
+            chat_id=handler,
+            text=f"I'm alive and watching over '{home.get('name')}', thanks for caring. Here's an xkcd for you {_xkcd()}",
         )
-    except TelegramError as e:
-        logger.error(f"Failed to send Höck reminder: {e}")
+    except TelegramError as exc:
+        logger.error("Home %s: failed to send heartbeat: %s", hid, exc)
+        return False
+
+    def mark(h):
+        if (h.get("roles") or {}).get("handler") != handler:
+            return  # role moved while we were sending; keep the new holder's metadata
+        h["heartbeat"] = {"last_sent": now.isoformat(), "uid": handler}
+
+    get_store().update(hid, mark)
+    return True
 
 
-async def send_initial_chronicler_backup(context: CallbackContext) -> None:
-    chronicler_chat_id = _get_chronicler_chat_id()
-    if not chronicler_chat_id:
-        logger.info("Chronicler ID is not configured; skipping initial backup dispatch.")
-        return
+# ------------------------------------------------------------------ sweep
+async def sweep_home(context, home, now=None) -> None:
+    """Run every step for one home, re-reading the home before each step so a
+    role change made during an earlier awaited send is respected."""
+    hid = home["id"]
+    for step in (weekly_report_step, hoeck_step, chronicler_step, heartbeat_step):
+        fresh = _fresh(hid)
+        if fresh is None:
+            return
+        await step(context, fresh, now)
 
-    data = load_data()
-    backup_meta = _get_chronicler_meta(data)
 
-    if backup_meta.get("greeting_sent"):
-        return
-
-    greeting = (
-        "Greetings, Chronicler! You have been entrusted with safeguarding our household's "
-        "history. Here is the first archive snapshot for your special role."
-    )
-
+async def sweep(context: CallbackContext) -> None:
     try:
-        await context.bot.send_message(chat_id=chronicler_chat_id, text=greeting)
-        with open(DATA_FILE, "rb") as doc:
-            await context.bot.send_document(
-                chat_id=chronicler_chat_id,
-                document=doc,
-                filename=DATA_FILE,
-                caption="Initial archive dispatch",
-            )
-    except (FileNotFoundError, TelegramError) as e:
-        logger.error(f"Failed to deliver initial backup to chronicler: {e}")
+        home_ids = [h["id"] for h in get_store().list_homes()]
+    except StoreError as exc:
+        logger.error("Sweep skipped, store unreadable: %s", exc)
         return
-
-    backup_meta["greeting_sent"] = True
-    backup_meta["last_sent"] = datetime.now(pytz.timezone("Europe/Berlin")).isoformat()
-    save_data(data)
-
-
-async def send_chronicler_backup(context: CallbackContext) -> None:
-    chronicler_chat_id = _get_chronicler_chat_id()
-    if not chronicler_chat_id:
-        logger.info("Chronicler ID is not configured; skipping scheduled backup dispatch.")
-        return
-
-    data = load_data()
-    backup_meta = _get_chronicler_meta(data)
-    comic = randint(1, 3163)
-    link = f"https://xkcd.com/{comic}/"
-
-    try:
-        with open(DATA_FILE, "rb") as doc:
-            await context.bot.send_document(
-                chat_id=chronicler_chat_id,
-                document=doc,
-                filename=DATA_FILE,
-                caption=f"Weekly archive backup and an xkcd for your troubles",
-            )
-    except (FileNotFoundError, TelegramError) as e:
-        logger.error(f"Failed to send chronicler backup: {e}")
-    try:
-        await context.bot.send_message(chat_id=chronicler_chat_id, text=f"{link}")
-    except TelegramError as e:
-        logger.error(f"Failed to send xkcd link to chronicler: {e}")
-        return
-
-    backup_meta["last_sent"] = datetime.now(pytz.timezone("Europe/Berlin")).isoformat()
-    save_data(data)
+    for hid in home_ids:
+        home = _fresh(hid)
+        if home is None:
+            continue
+        try:
+            await sweep_home(context, home)
+        except Exception:  # one broken home must not stop the others
+            logger.exception("Sweep failed for home %s", hid)
 
 
-def setup_chronicler_backup_job(application):
-    if not _get_chronicler_chat_id():
-        logger.info("Chronicler ID is not configured; chronicler backup jobs will not be scheduled.")
-        return
-
-    interval = timedelta(days=7).total_seconds()
+def setup_jobs(application) -> None:
     application.job_queue.run_repeating(
-        send_chronicler_backup,
-        interval=interval,
-        first=interval,
-        name="chronicler_backup",
+        sweep,
+        interval=SWEEP_INTERVAL_SECONDS,
+        first=5,
+        name="sweep",
+        job_kwargs={"misfire_grace_time": 30, "coalesce": True, "max_instances": 1},
     )
-    application.job_queue.run_once(
-        send_initial_chronicler_backup,
-        when=0,
-        name="chronicler_initial_backup",
-    )
-
-
-def setup_local_backup_job(application):
-    """Schedule twice-daily local backups at 04:00 and 16:00 Berlin time."""
     tz = pytz.timezone("Europe/Berlin")
     for hour in (4, 16):
         application.job_queue.run_daily(
@@ -191,47 +345,4 @@ def setup_local_backup_job(application):
             time=datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0).timetz(),
             name=f"local_backup_{hour:02d}h",
         )
-    # Write one immediately on startup so there's always a fresh copy.
     _write_local_backup()
-
-
-def setup_weekly_job(application, hour=9, minute=30):
-    tz = pytz.timezone("Europe/Berlin")
-    target_time = datetime.now(tz).replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-    if target_time.weekday() != 0 or datetime.now(tz) > target_time:
-        days_until_monday = (7 - target_time.weekday()) % 7
-        if days_until_monday == 0:
-            days_until_monday = 7
-        target_time = target_time + timedelta(days=days_until_monday)
-
-    current_time = datetime.now(tz)
-    seconds_until_target = (target_time - current_time).total_seconds()
-
-    for job in application.job_queue.get_jobs_by_name("weekly_penalty_check"):
-        job.schedule_removal()
-
-    application.job_queue.run_repeating(
-        check_weekly_penalties,
-        interval=timedelta(days=7).total_seconds(),
-        first=seconds_until_target,
-        name="weekly_penalty_check",
-        job_kwargs={
-            "misfire_grace_time": 600,
-            "coalesce": True,
-            "max_instances": 1,
-        },
-    )
-    logger.info(
-        f"Weekly report scheduled for {target_time.strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-
-async def send_alive(context: CallbackContext) -> None:
-    """Send a periodic heartbeat message to confirm the bot is running."""
-    comic = randint(1, 3163)
-    link = f"https://xkcd.com/{comic}/"
-    try:
-        await context.bot.send_message(chat_id=BOT_HANDLER_ID, text=f"I'm alive, thanks for caring, here's an xkcd for you {link}")
-    except TelegramError as e:
-        logger.error(f"Failed to send heartbeat: {e}")

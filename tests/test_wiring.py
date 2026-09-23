@@ -1,29 +1,33 @@
 """Regression guard for the Application wiring produced by wgcop.app.main()."""
 from telegram.ext import Application, ConversationHandler
 
+from wgcop import store as store_mod
+
 
 def test_main_builds_expected_handlers_and_jobs(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setattr(Application, "run_polling", lambda self, *a, **k: captured.setdefault("app", self))
     monkeypatch.chdir(tmp_path)  # bot_persistence.pkl lands here
+    store_mod.set_store(store_mod.Store(tmp_path / "wg_data_alpha.json"))
+    try:
+        from wgcop import app as appmod
 
-    from wgcop import app as appmod
-
-    appmod.main()
+        appmod.main()
+    finally:
+        store_mod.set_store(None)
     app = captured["app"]
 
     handlers = app.handlers[0]
     conversations = [h for h in handlers if isinstance(h, ConversationHandler)]
-    assert len(handlers) == 33
+    assert len(handlers) == 41
     assert len(conversations) == 9
     assert all(c.conversation_timeout == 300 for c in conversations)
+    # conversations are registered before every plain handler (see app.handoff)
+    assert all(isinstance(h, ConversationHandler) for h in handlers[:9])
+    # handoff relies on these ConversationHandler internals of the pinned PTB release
+    for attr in ("_get_key", "_conversations", "_update_state", "timeout_jobs", "_timeout_jobs_lock"):
+        assert hasattr(conversations[0], attr), attr
 
     job_names = sorted(j.name for j in app.job_queue.jobs())
-    assert job_names == [
-        "heartbeat",
-        "hoeck_reminder",
-        "local_backup_04h",
-        "local_backup_16h",
-        "weekly_penalty_check",
-        "weekly_report_catchup",
-    ]
+    assert job_names == ["local_backup_04h", "local_backup_16h", "sweep"]
+    assert (tmp_path / "wg_data_alpha.json").exists()

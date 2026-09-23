@@ -1,4 +1,8 @@
-"""Reply/inline keyboards, callback constants and conversation states (relocated verbatim)."""
+"""Reply/inline keyboards, button labels, callback constants and conversation states.
+
+Callback data never carries member names (Telegram caps it at 64 bytes and
+names are user input); members are addressed by their stable ``mid``.
+"""
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -6,9 +10,52 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 
-from wgcop.members import _get_member_name, _get_member_status, _normalise_member_name
+from wgcop.members import _get_member_name, _get_member_status
 
-# Callback data prefixes
+# ----------------------------------------------------------------- labels
+BTN_ADD_EXPENSE = "Add Expense"
+BTN_ADD_CHORE = "Add Chore"
+BTN_LIST_EXPENSES = "List Expenses"
+BTN_LIST_CHORES = "List Chores"
+BTN_STANDINGS = "Standings"
+BTN_PENALTIES = "Penalties"
+BTN_SETTINGS = "Settings"
+BTN_BACK_MAIN = "Back to Main Menu"
+BTN_BACK_SETTINGS = "Back to Settings"
+BTN_BACK_ADMIN = "Back to Admin"
+BTN_CANCEL = "Cancel"
+BTN_DONE = "Done"
+BTN_BACK = "Back"
+
+BTN_CHECK_PENALTIES = "Check Penalties"
+BTN_REDEEM_PENALTY = "Redeem Penalty"
+
+BTN_SWITCH_HOME = "Switch Home"
+BTN_ADMIN_PANEL = "Admin Panel"
+BTN_MANAGE_PREFIX = "Manage "          # "Manage <profile name>"
+BTN_SET_VACATION = "Set Vacation Status"
+BTN_EDIT_ENTRIES = "Edit Entries"
+BTN_CHANGE_USERNAME = "Change Username"
+
+BTN_MEMBER_MANAGEMENT = "Member Management"
+BTN_MANAGE_ROLES = "Manage Roles"
+BTN_HOME_SETTINGS = "Home Settings"
+BTN_MANAGE_WEEKLY = "Manage Weekly Report"
+BTN_ADJUST_PENALTIES = "Adjust Penalties"
+BTN_SET_HOECK = "Set WG-Höck"
+BTN_SYSTEM_OVERVIEW = "System Overview"
+
+BTN_SET_REPORT_TIME = "Set Report Time"
+BTN_TOGGLE_WEEKLY = "Toggle Weekly Report"
+BTN_TRIGGER_WEEKLY = "Trigger Weekly Report"
+
+BTN_EDIT_AMOUNT = "Amount"
+BTN_EDIT_SPLITTERS = "Splitters"
+
+BTN_MANUAL_ENTRY = "Manual Entry"
+BTN_SCAN_RECEIPT = "Scan Receipt"
+
+# ---------------------------------------------------------- callback data
 CB_PAYER_PREFIX = "payer:"
 CB_SPLIT_TOGGLE_PREFIX = "split_toggle:"
 CB_SPLIT_ALL = "split_all"
@@ -20,8 +67,20 @@ CB_RECEIPT_DONE = "receipt_done"
 CB_RECEIPT_CANCEL = "receipt_cancel"
 CB_RECEIPT_ACCEPT = "receipt_accept"
 CB_RECEIPT_MANUAL = "receipt_manual"
+CB_JOIN_NEW = "join:new"
+CB_JOIN_CLAIM_PREFIX = "join:claim:"
+CB_JOIN_CANCEL = "join:cancel"
+CB_JOIN_APPROVE_PREFIX = "join:approve:"
+CB_JOIN_DENY_PREFIX = "join:deny:"
 
-# States for conversation handler
+SPLIT_CALLBACK_PATTERN = r"^(?:split_toggle:.*|split_all|split_done|split_back|split_cancel)$"
+RECEIPT_CALLBACK_PATTERN = r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel|receipt_accept|receipt_manual)$"
+JOIN_CALLBACK_PATTERN = r"^join:(?:new|cancel|claim:.*|approve:.*|deny:.*)$"
+
+# Settings
+EXPENSE_LIST_LIMIT = 20
+
+# ------------------------------------------------------- conversation states
 (
     EXPENSE_MODE,
     EXPENSE_DESCRIPTION,
@@ -32,105 +91,111 @@ CB_RECEIPT_MANUAL = "receipt_manual"
     EXPENSE_RECEIPT_REVIEW,
 ) = range(7)
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
-MANAGE_MEMBER = range(1)
+MANAGE_MEMBER = 0
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
-ADMIN_BEER_MEMBER, ADMIN_BEER_COUNT = range(2)
+ADMIN_PENALTY_MEMBER, ADMIN_PENALTY_COUNT = range(2)
 ADMIN_HOECK_DATE = 0  # single-state conv
 ADMIN_REPORT_TIME = 0  # single-state conv
 CHANGE_USERNAME_NEW = 0  # single-state conv
+ROLES_MENU, ROLES_PICK_USER = range(2)
+HOME_SETTINGS_MENU, HOME_SETTINGS_VALUE = range(2)
 
-# Dynamic Keyboards
+
+def _rows(*labels):
+    return [[KeyboardButton(label)] for label in labels]
+
+
+# ------------------------------------------------------------ reply keyboards
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("Add Expense"), KeyboardButton("Add Chore")],
-            [KeyboardButton("List Expenses"), KeyboardButton("List Chores")],
-            [KeyboardButton("Standings"), KeyboardButton("Penalties")],
-            [KeyboardButton("Settings")],
+            [KeyboardButton(BTN_ADD_EXPENSE), KeyboardButton(BTN_ADD_CHORE)],
+            [KeyboardButton(BTN_LIST_EXPENSES), KeyboardButton(BTN_LIST_CHORES)],
+            [KeyboardButton(BTN_STANDINGS), KeyboardButton(BTN_PENALTIES)],
+            [KeyboardButton(BTN_SETTINGS)],
         ],
         resize_keyboard=True,
     )
 
 
-def get_member_keyboard(data):
-    members = data.get("members", [])
+def get_cancel_keyboard():
+    return ReplyKeyboardMarkup([[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
+
+
+def get_member_keyboard(home):
+    members = home.get("members", [])
     if not members:
         return None
     buttons = [[KeyboardButton(_get_member_name(member))] for member in members]
-    buttons.append([KeyboardButton("Done")])
+    buttons.append([KeyboardButton(BTN_CANCEL)])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-def get_settings_keyboard(is_admin=False, username=None):
-    label = f"Manage {username}" if username else "Manage Profile"
+def get_settings_keyboard(is_admin=False, username=None, multi_home=False):
+    label = f"{BTN_MANAGE_PREFIX}{username}" if username else f"{BTN_MANAGE_PREFIX}Profile"
     buttons = [[KeyboardButton(label)]]
+    if multi_home:
+        buttons.append([KeyboardButton(BTN_SWITCH_HOME)])
     if is_admin:
-        buttons.append([KeyboardButton("Admin Panel")])
-    buttons.append([KeyboardButton("Back to Main Menu")])
+        buttons.append([KeyboardButton(BTN_ADMIN_PANEL)])
+    buttons.append([KeyboardButton(BTN_BACK_MAIN)])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
 def get_admin_keyboard():
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Member Management")],
-            [KeyboardButton("Manage Weekly Report")],
-            [KeyboardButton("Adjust Beer Count")],
-            [KeyboardButton("Set WG-Höck")],
-            [KeyboardButton("System Overview")],
-            [KeyboardButton("Back to Settings")],
-        ],
+        _rows(
+            BTN_MEMBER_MANAGEMENT,
+            BTN_MANAGE_ROLES,
+            BTN_HOME_SETTINGS,
+            BTN_MANAGE_WEEKLY,
+            BTN_ADJUST_PENALTIES,
+            BTN_SET_HOECK,
+            BTN_SYSTEM_OVERVIEW,
+            BTN_BACK_SETTINGS,
+        ),
         resize_keyboard=True,
     )
 
 
 def get_weekly_report_keyboard():
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Set Weekly Report")],
-            [KeyboardButton("Set Report Time")],
-            [KeyboardButton("Trigger Weekly Report")],
-            [KeyboardButton("Back to Admin")],
-        ],
+        _rows(BTN_SET_REPORT_TIME, BTN_TOGGLE_WEEKLY, BTN_TRIGGER_WEEKLY, BTN_BACK_ADMIN),
         resize_keyboard=True,
     )
 
 
 def get_manage_self_keyboard():
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Set Vacation Status")],
-            [KeyboardButton("Edit Entries")],
-            [KeyboardButton("Change Username")],
-            [KeyboardButton("Back to Settings")],
-        ],
+        _rows(BTN_SET_VACATION, BTN_EDIT_ENTRIES, BTN_CHANGE_USERNAME, BTN_BACK_SETTINGS),
         resize_keyboard=True,
     )
 
 
 def get_penalties_keyboard():
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Check Beer Owed")],
-            [KeyboardButton("Redeem Beer")],
-            [KeyboardButton("Back to Main Menu")],
-        ],
+        _rows(BTN_CHECK_PENALTIES, BTN_REDEEM_PENALTY, BTN_BACK_MAIN),
         resize_keyboard=True,
     )
 
 
 def get_edit_choice_keyboard():
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("Amount")],
-            [KeyboardButton("Splitters")],
-            [KeyboardButton("Cancel")],
-        ],
+        _rows(BTN_EDIT_AMOUNT, BTN_EDIT_SPLITTERS, BTN_CANCEL),
         resize_keyboard=True,
     )
 
 
+def get_expense_mode_keyboard():
+    return ReplyKeyboardMarkup(
+        _rows(BTN_MANUAL_ENTRY, BTN_SCAN_RECEIPT, BTN_CANCEL),
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+# ----------------------------------------------------------- inline keyboards
 def _truncate_button_label(label: str, limit: int = 60) -> str:
     if len(label) <= limit:
         return label
@@ -140,56 +205,55 @@ def _truncate_button_label(label: str, limit: int = 60) -> str:
 def build_payer_inline_kb(members):
     rows = []
     for m in members:
-        name = _get_member_name(m)
-        rows.append([InlineKeyboardButton(name, callback_data=f"{CB_PAYER_PREFIX}{name}")])
+        rows.append(
+            [InlineKeyboardButton(_truncate_button_label(_get_member_name(m)), callback_data=f"{CB_PAYER_PREFIX}{m['mid']}")]
+        )
     return InlineKeyboardMarkup(rows)
 
 
-def build_split_inline_kb(members, selected):
-    # Sort members: active first, then vacating (italic, at the end)
-    active_members = []
-    vacating_members = []
-    
-    for m in members:
-        name = _get_member_name(m)
-        status = _get_member_status(m)
-        if status == "vacating":
-            vacating_members.append((name, m))
-        else:
-            active_members.append((name, m))
-    
+def build_split_inline_kb(members, selected_mids):
+    """Active members first, vacating members last, then All / Back / Done / Cancel."""
+    selected = set(selected_mids or ())
+    active = [m for m in members if _get_member_status(m) != "vacating"]
+    vacating = [m for m in members if _get_member_status(m) == "vacating"]
+
     rows = []
+    for m in active:
+        label = f"{_get_member_name(m)}{' ✅' if m['mid'] in selected else ''}"
+        rows.append([InlineKeyboardButton(_truncate_button_label(label), callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{m['mid']}")])
+    for m in vacating:
+        label = f"{_get_member_name(m)} (vacating){' ✅' if m['mid'] in selected else ''}"
+        rows.append([InlineKeyboardButton(_truncate_button_label(label), callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{m['mid']}")])
 
-    # Add active members first
-    for name, m in active_members:
-        picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
-        label = f"{name}{' ✅' if picked else ''}"
-        rows.append(
-            [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
-        )
-
-    # Add vacating members (reminder not to forget them for long-term only)
-    for name, m in vacating_members:
-        picked = _normalise_member_name(m) in {_normalise_member_name(s) for s in selected}
-        label = f"{name} (vacating){' ✅' if picked else ''}"
-        rows.append(
-            [InlineKeyboardButton(label, callback_data=f"{CB_SPLIT_TOGGLE_PREFIX}{name}")]
-        )
-
-    all_names = [name for name, _ in active_members + vacating_members]
-    all_selected = all_names and all(
-        _normalise_member_name(n) in {_normalise_member_name(s) for s in selected}
-        for n in all_names
-    )
-    rows.append(
-        [InlineKeyboardButton(f"All{' ✅' if all_selected else ''}", callback_data=CB_SPLIT_ALL)]
-    )
-
+    all_mids = {m["mid"] for m in members}
+    all_selected = bool(all_mids) and all_mids <= selected
+    rows.append([InlineKeyboardButton(f"All{' ✅' if all_selected else ''}", callback_data=CB_SPLIT_ALL)])
     rows.append(
         [
-            InlineKeyboardButton("Back", callback_data=CB_SPLIT_BACK),
-            InlineKeyboardButton("Done", callback_data=CB_SPLIT_DONE),
-            InlineKeyboardButton("Cancel", callback_data=CB_SPLIT_CANCEL),
+            InlineKeyboardButton(BTN_BACK, callback_data=CB_SPLIT_BACK),
+            InlineKeyboardButton(BTN_DONE, callback_data=CB_SPLIT_DONE),
+            InlineKeyboardButton(BTN_CANCEL, callback_data=CB_SPLIT_CANCEL),
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def build_join_choice_kb(unclaimed_members, telegram_name: str):
+    rows = [[InlineKeyboardButton(f"I'm new: {_truncate_button_label(telegram_name, 40)}", callback_data=CB_JOIN_NEW)]]
+    for m in unclaimed_members:
+        rows.append(
+            [InlineKeyboardButton(f"I am {_truncate_button_label(m['name'], 40)}", callback_data=f"{CB_JOIN_CLAIM_PREFIX}{m['mid']}")]
+        )
+    rows.append([InlineKeyboardButton(BTN_CANCEL, callback_data=CB_JOIN_CANCEL)])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_join_review_kb(uid: int):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Approve", callback_data=f"{CB_JOIN_APPROVE_PREFIX}{uid}"),
+                InlineKeyboardButton("Deny", callback_data=f"{CB_JOIN_DENY_PREFIX}{uid}"),
+            ]
+        ]
+    )

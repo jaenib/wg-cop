@@ -1,115 +1,72 @@
-"""Read-only views: recent expenses and standings (relocated verbatim)."""
+"""Read-only views: recent expenses and standings for the resolved home."""
 import html
 
 from telegram import Update
 from telegram.ext import CallbackContext
 
-from wgcop.formatting import _format_expense_entry, _format_signed_currency
-from wgcop.identity import _resolve_member_for_user
-from wgcop.keyboards import get_main_keyboard
-from wgcop.members import _get_member_name, _match_member_name, _normalise_member_name
-from wgcop.store import load_data
+from wgcop.formatting import format_expense_entry, format_signed_currency
+from wgcop.homes import home_currency, require_home
+from wgcop.keyboards import EXPENSE_LIST_LIMIT, get_main_keyboard
+from wgcop.members import _normalise_member_name, calculate_balances, chore_points_by_member
+from wgcop.store import member_for_uid
 
-# Settings
-EXPENSE_LIST_LIMIT = 20
 
-# Show latest logged expenses
 async def list_expenses(update: Update, context: CallbackContext) -> None:
-    data = load_data()
-    expenses = data.get("expenses", []) or []
+    home = await require_home(update, context)
+    if home is None:
+        return
+    expenses = home.get("expenses", []) or []
     if not expenses:
-        await update.message.reply_text(
-            "No expenses recorded yet.", reply_markup=get_main_keyboard()
-        )
+        await update.message.reply_text("No expenses recorded yet.", reply_markup=get_main_keyboard())
         return
 
-    members = data.get("members", []) or []
-    viewer = _resolve_member_for_user(update.effective_user)
-    context.user_data["viewer_member"] = viewer
-
+    viewer = member_for_uid(home, update.effective_user.id)
     if not viewer:
         await update.message.reply_text(
-            "I cannot match you to a household member. Please ask to be added to the member list.",
+            "I cannot match you to a member of this home. Send /join in the group to link your profile.",
             reply_markup=get_main_keyboard(),
         )
         return
 
-    viewer_name = _get_member_name(viewer)
+    viewer_name = viewer["name"]
     viewer_norm = _normalise_member_name(viewer_name)
+    currency = home_currency(home)
 
     relevant = []
     for entry in reversed(expenses):
-        payer = entry.get("payer")
-        split_with = entry.get("split_with", []) or []
-        is_payer = _normalise_member_name(payer) == viewer_norm
-        in_split = any(
-            _normalise_member_name(name) == viewer_norm for name in split_with
-        )
+        is_payer = _normalise_member_name(entry.get("payer")) == viewer_norm
+        in_split = any(_normalise_member_name(n) == viewer_norm for n in entry.get("split_with", []) or [])
         if is_payer or in_split:
             relevant.append(entry)
         if len(relevant) >= EXPENSE_LIST_LIMIT:
             break
 
     if not relevant:
-        await update.message.reply_text(
-            "No recent expenses linked to you.", reply_markup=get_main_keyboard()
-        )
+        await update.message.reply_text("No recent expenses linked to you.", reply_markup=get_main_keyboard())
         return
 
-    formatted = [
-        _format_expense_entry(entry, viewer_name) for entry in reversed(relevant)
-    ]
+    formatted = [format_expense_entry(entry, viewer_name, currency) for entry in reversed(relevant)]
     header = f"<b>Recent expenses involving {html.escape(viewer_name)}</b>"
-    text = header + "\n\n" + "\n\n".join(formatted)
-    text = text + "\n\n" + header
+    text = header + "\n\n" + "\n\n".join(formatted) + "\n\n" + header
     await update.message.reply_html(text, reply_markup=get_main_keyboard())
 
 
-# Calculate + show standings
 async def standings(update: Update, context: CallbackContext) -> None:
-    data = load_data()
-    members = data.get("members", [])
+    home = await require_home(update, context)
+    if home is None:
+        return
+    members = home.get("members", [])
     if not members:
-        await update.message.reply_text(
-            "No members recorded yet.", reply_markup=get_main_keyboard()
-        )
+        await update.message.reply_text("No members recorded yet.", reply_markup=get_main_keyboard())
         return
 
-    # Create member name dict for lookups
-    member_names = [_get_member_name(m) for m in members]
-    balances = {name: 0.0 for name in member_names}
+    balances = calculate_balances(home)
+    chores = chore_points_by_member(home)
+    currency = home_currency(home)
+    ordered = sorted((m["name"] for m in members), key=lambda n: chores.get(n, 0), reverse=True)
 
-    for expense in data.get("expenses", []):
-        payer = expense.get("payer", "")
-        amount = float(expense.get("amount", 0.0))
-        split_with = expense.get("split_with", []) or []
-        if not split_with:
-            continue
-        share = amount / len(split_with)
-
-        payer_matched = _match_member_name(members, payer)
-        payer_name = _get_member_name(payer_matched) if payer_matched else None
-        if payer_name:
-            balances[payer_name] = balances.get(payer_name, 0.0) + amount
-
-        for u in split_with:
-            u_matched = _match_member_name(members, u)
-            u_name = _get_member_name(u_matched) if u_matched else None
-            if u_name:
-                balances[u_name] = balances.get(u_name, 0.0) - share
-
-    chores = {}
-    for name, pts in (data.get("chores", {}) or {}).items():
-        mkey = _match_member_name(members, name)
-        if mkey:
-            chores[_get_member_name(mkey)] = pts
-
-    ordered = sorted(member_names, key=lambda m: (chores.get(m, 0)), reverse=True)
-
-    lines = []
-    for m in ordered:
-        points = chores.get(m, 0)
-        bal = balances.get(m, 0.0)
-        lines.append(f"{m}: {points} points, {_format_signed_currency(bal)}")
-
+    lines = [
+        f"{name}: {chores.get(name, 0)} points, {format_signed_currency(balances.get(name, 0.0), currency)}"
+        for name in ordered
+    ]
     await update.message.reply_text("\n".join(lines), reply_markup=get_main_keyboard())

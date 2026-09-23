@@ -73,17 +73,22 @@ class FakeMessage:
         self.photo = photo or []
         self.document = document
         self.replies = []       # (text, reply_markup, parse_mode)
+        self.sent_messages = [] # the FakeMessage objects returned by reply_*
         self.deleted = False
         self.sender_chat = None
         self.message_id = next(_MESSAGE_IDS)
 
     async def reply_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
         self.replies.append((text, reply_markup, parse_mode))
-        return FakeMessage(text=text, chat=self.chat)
+        sent = FakeMessage(text=text, chat=self.chat)
+        self.sent_messages.append(sent)
+        return sent
 
     async def reply_html(self, text, reply_markup=None, **kwargs):
         self.replies.append((text, reply_markup, "HTML"))
-        return FakeMessage(text=text, chat=self.chat)
+        sent = FakeMessage(text=text, chat=self.chat)
+        self.sent_messages.append(sent)
+        return sent
 
     async def delete(self):
         self.deleted = True

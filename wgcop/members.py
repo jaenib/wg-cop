@@ -1,14 +1,18 @@
-"""Member helpers, balance maths, renames and chore entries (relocated verbatim)."""
+"""Member helpers, balance maths, renames and chore entries.
+
+These are pure functions over a home dict (or the legacy data dict, which has
+the same ``members`` / ``expenses`` / ``chores`` keys). Nothing here persists
+anything; callers save through the store.
+"""
 import logging
 from datetime import datetime
 
 import pytz
 
-from wgcop.store import save_data
-
 logger = logging.getLogger(__name__)
 
-def _normalise_member_name(name: str) -> str:
+
+def _normalise_member_name(name) -> str:
     """Normalize a member name (string or object) to lowercase."""
     if isinstance(name, dict):
         name = name.get("name", "")
@@ -45,7 +49,6 @@ def _match_member_name(members, candidate):
 
 def calculate_balances(data):
     members = data.get("members", []) or []
-    # Create balance dict using member names (strings)
     member_names = [_get_member_name(m) for m in members]
     balances = {name: 0.0 for name in member_names}
 
@@ -53,7 +56,7 @@ def calculate_balances(data):
         amount = float(expense.get("amount", 0.0) or 0.0)
         payer = _match_member_name(members, expense.get("payer"))
         payer_name = _get_member_name(payer) if payer else None
-        
+
         split_with = []
         for participant in expense.get("split_with", []) or []:
             matched = _match_member_name(members, participant)
@@ -75,6 +78,17 @@ def calculate_balances(data):
     return balances
 
 
+def chore_points_by_member(data) -> dict:
+    """Chore totals keyed by the member's canonical display name (unknown names dropped)."""
+    members = data.get("members", []) or []
+    totals = {}
+    for raw_name, points in (data.get("chores", {}) or {}).items():
+        matched = _match_member_name(members, raw_name)
+        if matched:
+            totals[_get_member_name(matched)] = totals.get(_get_member_name(matched), 0) + int(points or 0)
+    return totals
+
+
 def _rename_member_in_data(data: dict, old_name: str, new_name: str) -> None:
     """Atomically rename a member across all data structures."""
     old_norm = _normalise_member_name(old_name)
@@ -84,18 +98,20 @@ def _rename_member_in_data(data: dict, old_name: str, new_name: str) -> None:
             m["name"] = new_name
 
     chores = data.setdefault("chores", {})
-    if old_name in chores:
-        chores[new_name] = chores.pop(old_name)
+    for key in [k for k in chores if _normalise_member_name(k) == old_norm]:
+        chores[new_name] = chores.get(new_name, 0) + chores.pop(key)
 
     penalties = data.setdefault("penalties", {})
-    if old_name in penalties:
-        penalties[new_name] = penalties.pop(old_name)
+    for key in [k for k in penalties if _normalise_member_name(k) == old_norm]:
+        penalties[new_name] = penalties.get(new_name, 0) + penalties.pop(key)
 
     violators = data.setdefault("last_week_violators", {})
-    old_v_key = _normalise_member_name(old_name)
     new_v_key = _normalise_member_name(new_name)
-    if old_v_key in violators:
-        violators[new_v_key] = violators.pop(old_v_key)
+    if old_norm in violators:
+        violators[new_v_key] = violators.pop(old_norm)
+
+    for request in (data.get("join_requests") or {}).values():
+        pass  # requests reference members by mid, nothing to rename
 
     for entry in data.get("chore_log") or []:
         if _normalise_member_name(entry.get("member", "")) == old_norm:
@@ -110,19 +126,16 @@ def _rename_member_in_data(data: dict, old_name: str, new_name: str) -> None:
         ]
 
 
-def add_chore_entry(data, member: str, points: int, description: str | None = None):
+def add_chore_entry(data, member: str, points: int, description: str | None = None, tz=None):
+    """Append a chore log entry and bump the member's total. Caller persists."""
     entry = {
-        "timestamp": datetime.now(pytz.timezone("Europe/Berlin")).isoformat(),
+        "timestamp": datetime.now(tz or pytz.timezone("Europe/Berlin")).isoformat(),
         "member": member,
         "points": points,
         "description": description or "",
     }
-
     data.setdefault("chore_log", []).append(entry)
-
-    # keep your existing totals working
     data.setdefault("chores", {})
     data["chores"].setdefault(member, 0)
     data["chores"][member] += points
-
-    save_data(data)
+    return entry

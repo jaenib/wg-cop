@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 _cfg_override = os.environ.get("WG_COP_CONFIG_FILE")
-CFG_PATH = Path(_cfg_override) if _cfg_override else ROOT / ".secrets" / "config.py"
+_candidates = (
+    [Path(_cfg_override)] if _cfg_override else [ROOT / ".secrets" / "config.py", ROOT / "config.py"]
+)
+CFG_PATH = next((p for p in _candidates if p.exists()), _candidates[0])
 
 if not CFG_PATH.exists():
     raise FileNotFoundError(
