@@ -85,7 +85,14 @@ async def group_member_status(bot, chat_id, uid) -> str | None:
 
 
 async def is_group_member(bot, chat_id, uid) -> bool:
-    return (await group_member_status(bot, chat_id, uid)) in GROUP_MEMBER_STATUSES
+    try:
+        member = await bot.get_chat_member(chat_id, uid)
+    except Exception:
+        return False
+    status = getattr(member, "status", None)
+    if status == "restricted":
+        return getattr(member, "is_member", False) is True
+    return status in ("creator", "administrator", "member")
 
 
 async def is_group_admin(bot, chat_id, uid) -> bool:
@@ -207,7 +214,7 @@ def owns_keyboard(query, flow) -> bool:
     """True if the tapped inline keyboard is the one this draft sent."""
     expected = flow.get("kb_msg")
     actual = getattr(getattr(query, "message", None), "message_id", None)
-    return expected is None or actual is None or expected == actual
+    return expected is not None and actual is not None and expected == actual
 
 
 # -------------------------------------------------------------------- roles

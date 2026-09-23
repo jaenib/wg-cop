@@ -137,7 +137,7 @@ def test_flows_are_namespaced_per_chat(store):
 def test_owns_keyboard_checks_message_id():
     msg = FakeMessage("kb")
     query = type("Q", (), {"message": msg})()
-    assert owns_keyboard(query, {})
+    assert not owns_keyboard(query, {})
     assert owns_keyboard(query, {"kb_msg": msg.message_id})
     assert not owns_keyboard(query, {"kb_msg": msg.message_id + 1})
 
