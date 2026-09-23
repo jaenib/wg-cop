@@ -22,6 +22,7 @@ from wgcop.members import _match_member_name, _normalise_member_name
 from wgcop.store import get_store, member_for_uid
 
 CANCEL_WORDS = {"cancel", "back to main menu"}
+MAX_AMOUNT = 1_000_000
 
 
 def _find_last_expense_for_payer(expenses, payer_name):
@@ -128,15 +129,16 @@ async def edit_entries_amount(update: Update, context: CallbackContext) -> int:
     except ValueError:
         await update.message.reply_text("Please provide a number (e.g. 12.50).")
         return EDIT_AMOUNT
-    if not math.isfinite(amount) or amount <= 0:
-        await update.message.reply_text("Amount must be greater than zero.")
+    amount = round(amount, 2) if math.isfinite(amount) else amount
+    if not math.isfinite(amount) or amount <= 0 or amount > MAX_AMOUNT:
+        await update.message.reply_text("Amount must be greater than zero (two decimals).")
         return EDIT_AMOUNT
 
     def apply(h):
         entry = _locate(h, flow)
         if entry is None:
             return None
-        entry["amount"] = round(amount, 2)
+        entry["amount"] = amount
         return dict(entry)
 
     _, updated = get_store().update(home["id"], apply)

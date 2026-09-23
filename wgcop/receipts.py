@@ -2,6 +2,7 @@
 import base64
 import json
 import logging
+import math
 import os
 from datetime import datetime
 
@@ -122,11 +123,15 @@ def _parse_receipt_ocr_response(raw: str, log_prefix: str):
     logger.info("%s raw JSON: %s", log_prefix, raw_json)
     parsed = json.loads(raw_json)
     items = parsed["items"]
+    if not isinstance(items, list):
+        raise ValueError("Receipt items must be a list")
     description = str(parsed.get("description", "")).strip()
     receipt_total = parsed.get("total_observed")
     if receipt_total is not None:
         try:
             receipt_total = round(float(receipt_total), 2)
+            if not math.isfinite(receipt_total) or receipt_total <= 0:
+                raise ValueError("Invalid receipt total")
         except (TypeError, ValueError):
             receipt_total = None
     return raw_json, items, description, receipt_total
@@ -144,13 +149,19 @@ def _normalise_receipt_items(items, log_prefix: str):
         try:
             quantity = float(raw_quantity) if raw_quantity is not None else 1.0
             unit_price = float(raw_unit_price)
+            if not math.isfinite(quantity) or not math.isfinite(unit_price) or quantity <= 0:
+                continue
         except (TypeError, ValueError):
             continue
         computed = round(quantity * unit_price, 2)
+        if not math.isfinite(computed):
+            continue
         observed = None
         try:
             if raw_line_total_observed is not None:
                 observed = round(float(raw_line_total_observed), 2)
+                if not math.isfinite(observed):
+                    observed = None
         except (TypeError, ValueError):
             pass
         logger.info(
@@ -197,7 +208,7 @@ def extract_items_from_receipt(image_path: str, mime_type: str = "image/jpeg"):
     except Exception as exc:
         raise ReceiptParsingError("Failed to read the receipt image.") from exc
 
-    client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY)
+    client = _openai_lib.OpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=1)
     ts = datetime.now(pytz.UTC).isoformat()
     log_entry: dict = {"ts": ts, "image_path": image_path, "passes": []}
 
