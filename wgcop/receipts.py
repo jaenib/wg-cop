@@ -8,7 +8,7 @@ from datetime import datetime
 import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from wgcop.config import BACKUP_DIR, OPENAI_API_KEY, RECEIPT_TOLERANCE_CHF
+from wgcop.botconfig import BACKUP_DIR, OPENAI_API_KEY, RECEIPT_TOLERANCE_CHF
 from wgcop.keyboards import (
     CB_RECEIPT_CANCEL,
     CB_RECEIPT_DONE,

@@ -1,7 +1,7 @@
 """Telegram user -> member resolution (relocated verbatim; data-driven links land in B4)."""
 import logging
 
-from wgcop.config import GI_ID, GY_ID, JA_ID, NI_ID, TO_ID
+from wgcop.botconfig import GI_ID, GY_ID, JA_ID, NI_ID, TO_ID
 from wgcop.members import _get_member_name, _member_to_dict, _normalise_member_name
 from wgcop.store import load_data, save_data
 

@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from wgcop.config import TOKEN
+from wgcop.botconfig import TOKEN
 from wgcop.handlers.admin import (
     admin_beer_count,
     admin_beer_member,

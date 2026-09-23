@@ -2,7 +2,7 @@
 from telegram import Update
 from telegram.ext import CallbackContext, ConversationHandler
 
-from wgcop.config import BOT_HANDLER_ID
+from wgcop.botconfig import BOT_HANDLER_ID
 from wgcop.identity import _resolve_member_for_user
 from wgcop.keyboards import (
     get_admin_keyboard,

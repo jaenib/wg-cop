@@ -3,7 +3,7 @@ import json
 import logging
 import os
 
-from wgcop.config import DATA_FILE
+from wgcop.botconfig import DATA_FILE
 
 logger = logging.getLogger(__name__)
 

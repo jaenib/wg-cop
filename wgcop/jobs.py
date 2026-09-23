@@ -10,7 +10,7 @@ import pytz
 from telegram.error import TelegramError
 from telegram.ext import CallbackContext
 
-from wgcop.config import (
+from wgcop.botconfig import (
     BACKUP_DIR,
     BACKUP_KEEP,
     BOT_HANDLER_ID,

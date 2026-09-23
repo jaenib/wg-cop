@@ -48,7 +48,7 @@ tracks own disjoint modules.
 
 | Track | Owner | Owns (after B1) |
 |-------|-------|-----------------|
-| **B — build** (multi-home, roles, settings) | build agent (this session, `worktree-multi-home`) | `wgcop/store.py`, `wgcop/homes.py`, `wgcop/config.py`, `wgcop/jobs.py`, `wgcop/handlers/{settings,admin,home}.py`, `wgcop/app.py` (wiring), `maBot.py` entry |
+| **B — build** (multi-home, roles, settings) | build agent (this session, `worktree-multi-home`) | `wgcop/store.py`, `wgcop/homes.py`, `wgcop/botconfig.py`, `wgcop/jobs.py`, `wgcop/handlers/{settings,admin,home}.py`, `wgcop/app.py` (wiring), `maBot.py` entry |
 | **A — maintenance** (stability, bugs, hygiene, deploy, ops) | second agent | `tests/`, `.github/`, `README.md`, `docs/`, `deploy.sh`, `wgcop/reports.py`, `wgcop/receipts.py`, `wgcop/handlers/{expense,chore,edit,penalties}.py` bug fixes, logging setup, `ops/` |
 
 Rules of engagement:

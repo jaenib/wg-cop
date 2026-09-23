@@ -9,7 +9,7 @@ import pytz
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import CallbackContext, ConversationHandler
 
-from wgcop.config import (
+from wgcop.botconfig import (
     BOT_HANDLER_ID,
     CHRONICLER_ID,
     DATA_FILE,
