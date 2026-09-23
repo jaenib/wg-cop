@@ -26,7 +26,7 @@ def homes(tmp_path, monkeypatch):
 async def run_bot(scenario):
     driver = TelegramDriver()
     app = (Application.builder().token("123456:TEST-TOKEN-NOT-REAL")
-           .request(driver).get_updates_request(driver).job_queue(None).build())
+           .request(driver).get_updates_request(driver).build())
     register_handlers(app)
     errors = []
 
@@ -35,16 +35,22 @@ async def run_bot(scenario):
 
     app.add_error_handler(catch_error)
     async with app:
-        await scenario(app, driver)
+        await app.start()
+        try:
+            await scenario(app, driver)
+        finally:
+            await app.stop()
     assert not errors, errors
 
 
 async def message(app, driver, cid, text, uid=10):
-    await app.process_update(driver.message_update(app.bot, uid, cid, text))
+    await app.update_queue.put(driver.message_update(app.bot, uid, cid, text))
+    await app.update_queue.join()
 
 
 async def callback(app, driver, cid, mid, data, uid=10):
-    await app.process_update(driver.callback_update(app.bot, uid, cid, mid, data))
+    await app.update_queue.put(driver.callback_update(app.bot, uid, cid, mid, data))
+    await app.update_queue.join()
 
 
 async def expense_to_payer(app, driver, cid, description, uid=10):
