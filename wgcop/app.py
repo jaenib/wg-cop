@@ -76,6 +76,8 @@ from wgcop.handlers.members import (
     start_change_username,
 )
 from wgcop.handlers.penalties import check_penalties, redeem_count, redeem_member, redeem_start
+from wgcop.handlers.roles import open_roles, roles_menu, roles_pick
+from wgcop.handlers.settings import home_settings_menu, home_settings_value, open_home_settings
 from wgcop.handlers.views import list_expenses, standings
 from wgcop.homes import CB_HOME_SELECT, end_flow
 from wgcop.jobs import setup_jobs
@@ -95,9 +97,11 @@ from wgcop.keyboards import (
     BTN_CHANGE_USERNAME,
     BTN_CHECK_PENALTIES,
     BTN_EDIT_ENTRIES,
+    BTN_HOME_SETTINGS,
     BTN_LIST_CHORES,
     BTN_LIST_EXPENSES,
     BTN_MANAGE_PREFIX,
+    BTN_MANAGE_ROLES,
     BTN_MANAGE_WEEKLY,
     BTN_MEMBER_MANAGEMENT,
     BTN_PENALTIES,
@@ -127,11 +131,15 @@ from wgcop.keyboards import (
     EXPENSE_RECEIPT,
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_SPLIT,
+    HOME_SETTINGS_MENU,
+    HOME_SETTINGS_VALUE,
     JOIN_CALLBACK_PATTERN,
     MANAGE_MEMBER,
     RECEIPT_CALLBACK_PATTERN,
     REDEEM_COUNT,
     REDEEM_MEMBER,
+    ROLES_MENU,
+    ROLES_PICK_USER,
     SPLIT_CALLBACK_PATTERN,
 )
 from wgcop.store import StoreError, get_store
@@ -155,6 +163,7 @@ NAV_LABELS = (
     BTN_REDEEM_PENALTY, BTN_SWITCH_HOME, BTN_ADMIN_PANEL, BTN_SET_VACATION, BTN_EDIT_ENTRIES,
     BTN_CHANGE_USERNAME, BTN_MEMBER_MANAGEMENT, BTN_MANAGE_WEEKLY, BTN_ADJUST_PENALTIES, BTN_SET_HOECK,
     BTN_SYSTEM_OVERVIEW, BTN_SET_REPORT_TIME, BTN_TOGGLE_WEEKLY, BTN_TRIGGER_WEEKLY,
+    BTN_MANAGE_ROLES, BTN_HOME_SETTINGS,
 )
 NAV_FILTER = (
     filters.Regex("^(" + "|".join(re.escape(label) for label in NAV_LABELS) + ")$")
@@ -290,6 +299,18 @@ def register_handlers(app: Application) -> None:
 
 
 def _register_conversations(app: Application) -> None:
+    app.add_handler(_conversation(BTN_MANAGE_ROLES, {
+        "__entry__": open_roles,
+        ROLES_MENU: _text_steps(roles_menu, cancel_first=False),
+        ROLES_PICK_USER: _text_steps(roles_pick, cancel_first=False),
+    }, allow_reentry=True))
+
+    app.add_handler(_conversation(BTN_HOME_SETTINGS, {
+        "__entry__": open_home_settings,
+        HOME_SETTINGS_MENU: _text_steps(home_settings_menu, cancel_first=False),
+        HOME_SETTINGS_VALUE: _text_steps(home_settings_value, cancel_first=False),
+    }, allow_reentry=True))
+
     app.add_handler(_conversation(BTN_ADJUST_PENALTIES, {
         "__entry__": admin_penalty_start,
         ADMIN_PENALTY_MEMBER: _text_steps(admin_penalty_member),

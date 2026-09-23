@@ -52,6 +52,23 @@ BTN_TRIGGER_WEEKLY = "Trigger Weekly Report"
 BTN_EDIT_AMOUNT = "Amount"
 BTN_EDIT_SPLITTERS = "Splitters"
 
+# Manage Roles submenu (conversation-internal choices, not navigation labels)
+BTN_ROLE_ADD_ADMIN = "Add Admin"
+BTN_ROLE_REMOVE_ADMIN = "Remove Admin"
+BTN_ROLE_SET_CHRONICLER = "Set Chronicler"
+BTN_ROLE_SET_HANDLER = "Set Handler"
+BTN_ROLE_UNLINK = "Unlink Member"
+BTN_ROLE_REQUESTS = "Join Requests"
+BTN_NONE = "None"
+
+# Home Settings submenu
+BTN_SETTING_NAME = "Home Name"
+BTN_SETTING_CURRENCY = "Currency"
+BTN_SETTING_TIMEZONE = "Timezone"
+BTN_SETTING_MINUTES = "Minutes per Point"
+BTN_SETTING_THRESHOLD = "Penalty Threshold"
+BTN_SETTING_UNIT = "Penalty Unit"
+
 BTN_MANUAL_ENTRY = "Manual Entry"
 BTN_SCAN_RECEIPT = "Scan Receipt"
 
@@ -185,6 +202,39 @@ def get_edit_choice_keyboard():
         _rows(BTN_EDIT_AMOUNT, BTN_EDIT_SPLITTERS, BTN_CANCEL),
         resize_keyboard=True,
     )
+
+
+def get_roles_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_ROLE_ADD_ADMIN), KeyboardButton(BTN_ROLE_REMOVE_ADMIN)],
+            [KeyboardButton(BTN_ROLE_SET_CHRONICLER), KeyboardButton(BTN_ROLE_SET_HANDLER)],
+            [KeyboardButton(BTN_ROLE_UNLINK), KeyboardButton(BTN_ROLE_REQUESTS)],
+            [KeyboardButton(BTN_BACK_ADMIN)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_home_settings_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_SETTING_NAME), KeyboardButton(BTN_SETTING_CURRENCY)],
+            [KeyboardButton(BTN_SETTING_TIMEZONE), KeyboardButton(BTN_SETTING_MINUTES)],
+            [KeyboardButton(BTN_SETTING_THRESHOLD), KeyboardButton(BTN_SETTING_UNIT)],
+            [KeyboardButton(BTN_BACK_ADMIN)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def build_pick_keyboard(labels, extra=None):
+    """One button per label (plus optional extras), then Cancel."""
+    rows = [[KeyboardButton(_truncate_button_label(label))] for label in labels]
+    for label in extra or ():
+        rows.append([KeyboardButton(label)])
+    rows.append([KeyboardButton(BTN_CANCEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def get_expense_mode_keyboard():
