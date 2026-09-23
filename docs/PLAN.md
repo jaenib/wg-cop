@@ -231,3 +231,33 @@ social score; migration touches all of it at once. Scope:
 | B6 | B | feat(ui): /newhome, Switch Home, Manage Roles, Home Settings, per-home System Overview | B5 |
 | A6 | A | docs+ops: README for multi-home, ops/server_checklist.md, enable service at boot | B6 |
 | — | both | integration/multi-home -> main (production deploy, watch journal) | all |
+
+## 7. Status as of 2026-09-23 (branch `worktree-multi-home`)
+
+Delivered, in order, each commit green under pytest and pyflakes:
+
+| Commit | What |
+|--------|------|
+| `d68e057` | docs: this plan |
+| `b0c8113` + `f68c9d5` | B1 package split (+ fix: `wgcop/config.py` was git-ignored, renamed to `botconfig.py`; the fix commit also carries the B2 harness) |
+| `ef3ef09` | B3 store: schema-2 envelope, atomic writes, revisions, legacy migration |
+| `63b63ca` | B4 homes: identity, resolution, per-chat flows, roles, joining |
+| `0bf900d` | B5: every handler/job on home-scoped data; navigation hand-off; data-driven sweep job |
+| `04fc4b2`, `9fb2da7`, `70d1fb4`, `1fcd52e` | cherry-picked from `codex/multi-home`: store/homes boundary fixes, Telegram driver, dispatch + scheduler regressions |
+| `30e57a2` | fix(bookkeeping): zero-rounding edits, non-finite receipt lines (receipts hunks from Codex 7d70518) |
+| B6 | feat(ui): Manage Roles and Home Settings menus |
+
+Behavioural summary for release review:
+
+* First start on the server migrates `wg_data_alpha.json` in place (archive
+  `wg_data_alpha.json.pre-multihome.bak`), keeps every expense/chore/penalty,
+  and seeds the existing group as the first home with `BOT_HANDLER_ID` as its
+  admin and handler. Members already carrying `uid` stay linked; the two
+  without one are linked from the config ids (typo-tolerant), so all five are
+  linked after migration in production.
+* Config keys other than `TOKEN` are optional from now on.
+* New homes: `/newhome <name>` in a group (Telegram group admins), `/join`
+  for members, admin approval for claiming an existing profile.
+* Jobs: one `sweep` every minute (weekly report per home, Höck, chronicler,
+  heartbeat) plus two daily local backups. No restart needed for any setting.
+* Known limitation: a home always belongs to exactly one Telegram group.
