@@ -117,76 +117,86 @@ Repo hygiene:
 
 ## 4. Track B design: multiple homes, roles set in Telegram
 
+Decisions agreed with the maintenance agent on 2026-09-23 (see the mailbox
+`COORDINATION.md` in the main checkout). Earlier drafts of this section
+(per-home files, implicit bot-owner privileges, invite codes) are superseded.
+
 ### Data layout
 
+One versioned envelope at `WG_COP_DATA_FILE` (default `wg_data_alpha.json`,
+already covered by the deploy and rsync protections):
+
 ```
-data/                        (env WG_COP_DATA_DIR, default ./data; git-ignored, deploy-protected)
-  registry.json              {"users": {uid: {"active_home": id}}, "groups": {chat_id: home_id}}
-  homes/<home_id>.json       {"id","name","created","settings":{...},"roles":{...},
-                              "members":[...],"expenses":[...],"chores":{},"chore_log":[],
-                              "penalties":{},"last_week_violators":{},
-                              "weekly_report_meta":{},"chronicler_backup":{}}
+{"schema_version": 2,
+ "homes": {"<group chat id>": {
+     "id", "name", "group_chat_id", "created", "revision", "member_seq",
+     "settings": {"currency", "timezone", "weekly_report_time", "weekly_report_enabled",
+                  "penalty_threshold_points", "minutes_per_point", "penalty_unit", "wg_hoeck_date"},
+     "roles": {"admins": [uid], "chronicler": uid|null, "handler": uid|null},
+     "members": [{"mid", "name", "status", "uid"?}],
+     "expenses", "chores", "chore_log", "penalties", "last_week_violators",
+     "join_requests", "weekly_report_meta", "chronicler_backup"}},
+ "selections": {"<uid>": "<home id>"}}
 ```
 
-Per-home `settings`: `group_chat_id`, `currency` (CHF), `timezone`
-(Europe/Berlin), `weekly_report_time` (HH:MM), `penalty_threshold_points` (4),
-`minutes_per_point` (15), `penalty_unit` ("beer"), `wg_hoeck_date`.
+* Home id = Telegram group chat id; a home always belongs to a group.
+* Writes are atomic (temp file, fsync, rename) and the whole envelope is
+  validated before the rename. `Store.update(home_id, fn)` is the synchronous
+  read-modify-write used by jobs; `Store.save_home(snapshot)` rejects stale
+  snapshots through the per-home `revision`.
+* Corrupt or unversioned files are refused at startup and never replaced.
 
-Per-home `roles`: `admins: [uid]`, `chronicler: uid|null`. Member objects keep
-`uid` for the Telegram link. The config `BOT_HANDLER_ID` becomes the **bot
-owner**: implicit admin of every home and heartbeat recipient. All other
-config IDs become optional and are only used once, by the migration.
+### Migration
 
-### Migration (automatic, idempotent, on first start)
+First start with a legacy (schema-less) file: archive it as
+`<file>.pre-multihome.bak` (exclusive create), build one home keyed by the
+legacy `group_chat_id` (fallback `GROUP_CHAT_ID`), seed
+`roles.admins=[BOT_HANDLER_ID]`, `roles.handler=BOT_HANDLER_ID`,
+`roles.chronicler=CHRONICLER_ID`, stamp member `uid`s from the old
+`NI_ID..JA_ID` keys (typo-tolerant name match), validate the full envelope,
+write, re-read. Rollback = restore the archive and redeploy the old code
+(changes made after migration then need reconciliation).
 
-If `data/homes/` is empty and the legacy `wg_data_alpha.json` exists: create
-one home from it, seed `settings` from config (`GROUP_CHAT_ID`,
-`weekly_report_time`, `wg_hoeck_date`), `roles.admins=[BOT_HANDLER_ID]`,
-`roles.chronicler=CHRONICLER_ID`, and stamp `uid` on members using the old
-`NI_ID..JA_ID` map (normalised name match, tolerant of the typo). The legacy
-file is left in place and never written again; a marker
-`data/migrated_from_legacy.json` records what happened. Rollback = redeploy old
-code (it still reads the legacy file; changes made after migration would need
-the export tool `tools/export_home.py`).
+### Identity and roles
 
-### Resolution: which home is this update for?
+* Authorization lives only in `home.roles`. The config `BOT_HANDLER_ID` has
+  no runtime privilege; it is a migration seed. Each home has a `handler`
+  role (receives that home's heartbeat), editable like admins and chronicler.
+* Anonymous senders (`sender_chat`, bots) are never identities.
+* The last administrator of a home cannot be removed.
+* Removing a member is refused while the member appears in expenses, chores
+  or penalties; unlink or set vacating instead.
 
-`resolve_home(update, context)`:
+### Resolution
 
-1. Group/supergroup chat -> `registry.groups[chat_id]`; if none, reply with
-   how to link (`/linkhome` by an admin) and stop.
-2. Private chat -> homes where the user is a member or admin. One -> that.
-   Several -> `registry.users[uid].active_home` if valid, else an inline
-   picker (and *Settings -> Switch Home*). None -> offer `/newhome <name>` or
-   ask for an invite code.
-3. The bot owner may address any home via the picker.
+Group chat: the home registered for that chat (non-members are told to
+`/join`). Private chat: the caller's single home, else their stored selection
+(`Settings -> Switch Home`), else an inline picker.
 
-### Joining and linking (replaces the hard-coded UID map)
+### Joining (no invite codes)
 
-* Admin -> Member Management -> *Invite* shows a code and a deep link
-  `t.me/<bot>?start=join_<code>` (rotatable). `/start join_<code>` or
-  `/join <code>` in DM lets the user pick an unclaimed member name or create a
-  new member from their Telegram name; the uid is stored on the member.
-* Admin -> Manage Roles: add/remove admin (pick from linked members), set
-  chronicler, unlink a member, transfer ownership. Every role change is a
-  data write; no restart, no config edit.
+`/newhome <name>` inside a group, by a Telegram group admin or creator, creates
+the home and makes them its first admin. `/join` in the home's group links the
+sender: a new member from their Telegram name immediately, or a request to
+claim an existing unlinked member that a home admin approves. `/join` in a DM
+checks `get_chat_member` against every home's group.
+
+### Conversation state
+
+Drafts live in `user_data["flow:<chat_id>"]` together with the home id they
+started in; every step re-checks access; callback handlers verify that the
+keyboard message id belongs to the caller's draft; callback data carries the
+member `mid`, never the name (Telegram's 64-byte limit). Switching home in a
+DM clears that chat's draft.
 
 ### Jobs
 
-`jobs.py` reschedules per home: weekly report `weekly:<home_id>` at that
-home's time/timezone; daily Höck sweep and weekly chronicler sweep iterate all
-homes; local backup copies the whole `data/` tree; heartbeat stays a singleton
-to the owner.
-
-### Systemic reconstruction that pays off
-
-* The package split (B1) is the enabler for parallel work and for tests; it
-  is not optional.
-* A `Home` object (`home.data`, `home.settings`, `home.save()`) replaces the
-  global `load_data()/save_data()` pair. Handlers load once and save once,
-  which also removes the lost-update pattern (finding 4).
-* Currency, timezone, thresholds and labels move from literals to
-  `home.settings`, which is what "everything settable from Telegram" needs.
+Per-home weekly report at the home's own time and timezone. Penalties are
+applied once, inside `Store.update`, and the rendered text is kept in
+`weekly_report_meta.pending` until delivered; delivery is retried by the
+catch-up job. Daily Höck sweep and weekly chronicler export (that home only)
+iterate all homes. The local backup copies the whole file. The heartbeat goes
+to each home's `handler`.
 
 ## 5. Test suite: needed, and what it covers
 

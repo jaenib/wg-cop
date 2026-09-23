@@ -3,7 +3,16 @@
 They record every outgoing call so tests can assert on what the bot said and
 which keyboard it attached, without a network or a real Application.
 """
+import asyncio
+import itertools
 from types import SimpleNamespace
+
+_MESSAGE_IDS = itertools.count(1000)
+
+
+def run(coro):
+    """Run one handler coroutine to completion on a fresh event loop."""
+    return asyncio.run(coro)
 
 
 class FakeBot:
@@ -66,6 +75,7 @@ class FakeMessage:
         self.replies = []       # (text, reply_markup, parse_mode)
         self.deleted = False
         self.sender_chat = None
+        self.message_id = next(_MESSAGE_IDS)
 
     async def reply_text(self, text, reply_markup=None, parse_mode=None, **kwargs):
         self.replies.append((text, reply_markup, parse_mode))

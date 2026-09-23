@@ -31,8 +31,11 @@ def _reload_with(tmp_path, monkeypatch, body):
     try:
         return importlib.import_module("wgcop.botconfig")
     finally:
-        # restore the session-wide module for the other tests
+        # restore the session-wide module (and the package attribute) for the other tests
+        import wgcop
+
         sys.modules["wgcop.botconfig"] = botconfig
+        wgcop.botconfig = botconfig
 
 
 def test_token_only_config_is_enough(tmp_path, monkeypatch):
@@ -56,4 +59,6 @@ def test_extra_legacy_member_ids_are_merged(tmp_path, monkeypatch):
 
 
 def test_env_override_points_at_the_file():
+    session_dir = os.environ["WG_COP_TEST_SESSION_DIR"]
     assert str(botconfig.CFG_PATH) == os.environ["WG_COP_CONFIG_FILE"]
+    assert str(botconfig.CFG_PATH).startswith(session_dir)
