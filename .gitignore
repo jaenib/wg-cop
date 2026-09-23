@@ -6,7 +6,7 @@ porter*
 *.pyc
 __pycache__/
 .env
-config.py
+/config.py
 .venv/
 venv/
 .secrets
