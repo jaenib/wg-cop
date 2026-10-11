@@ -12,6 +12,7 @@ from wgcop.homes import (
     end_flow,
     flow_home,
     flow_state,
+    is_group_chat,
     require_home,
     resolve_home,
 )
@@ -161,6 +162,33 @@ async def on_timeout(update: Update, context: CallbackContext) -> int:
             reply_markup=get_main_keyboard(),
         )
     return ConversationHandler.END
+
+
+STRAY_LABELS = {"back"}  # conversation-internal buttons that mean nothing outside a conversation
+
+
+async def stray_text(update: Update, context: CallbackContext) -> None:
+    """Text that no conversation or menu claimed, e.g. a 'Back' tapped after a restart.
+
+    A restart forgets every running conversation, but the reply keyboard it showed
+    stays on the user's screen. Instead of silence, drop the leftover draft and offer
+    the menu. In groups only the known leftover labels are answered; chat is ignored.
+    """
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    text = (message.text or "").strip().casefold()
+    if is_group_chat(chat) and text not in STRAY_LABELS:
+        return
+    end_flow(context, chat.id)
+    home = await require_home(update, context)
+    if home is None:
+        return  # require_home already said why (no home yet, or a picker to choose one)
+    await message.reply_text(
+        "Nothing is in progress (perhaps I was restarted). Back to the main menu:",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 async def open_penalties(update: Update, context: CallbackContext) -> None:

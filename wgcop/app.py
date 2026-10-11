@@ -47,6 +47,7 @@ from wgcop.handlers.common import (
     open_weekly_report_menu,
     settings_back,
     start,
+    stray_text,
 )
 from wgcop.handlers.edit import (
     edit_entries_amount,
@@ -312,6 +313,10 @@ def register_handlers(app: Application) -> None:
     # gets first shot at /cancel and can properly end the conversation.
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(MessageHandler(_exact(BTN_CANCEL), cancel))
+
+    # Leftover text, e.g. a 'Back' tapped after a restart forgot the conversation
+    # that showed the keyboard: answer with the menu instead of silence.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, stray_text))
 
 
 def _register_conversations(app: Application) -> None:
