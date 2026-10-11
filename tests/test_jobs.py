@@ -114,7 +114,7 @@ def test_chronicler_initial_then_weekly_export_of_this_home_only(store):
 
     assert run(jobs.chronicler_step(ctx, home(store), TUESDAY + timedelta(days=1))) is None
     assert run(jobs.chronicler_step(ctx, home(store), TUESDAY + timedelta(days=8))) == "weekly"
-    assert "xkcd.com" in ctx.bot.sent[-1][1]
+    assert ctx.bot.sent[-1][1].startswith("https://xkcd.com/")
 
 
 def test_chronicler_without_role_is_silent(store):

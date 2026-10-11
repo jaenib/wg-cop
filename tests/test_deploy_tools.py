@@ -57,8 +57,10 @@ elif name == "sleep":
         executable.chmod(0o755)
     # The helper intentionally uses python3 independent of a production venv.
     (binaries / "python3").symlink_to(sys.executable)
+    # The ssh shim runs tar locally; macOS bsdtar would add "._" AppleDouble entries.
     env = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ["PATH"],
-               TEST_REMOTE=str(remote), TEST_TRACE=str(trace), TMPDIR=str(tmp_path))
+               TEST_REMOTE=str(remote), TEST_TRACE=str(trace), TMPDIR=str(tmp_path),
+               COPYFILE_DISABLE="1")
     return remote, trace, env
 
 
