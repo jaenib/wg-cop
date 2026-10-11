@@ -2,6 +2,7 @@
 import json
 
 import pytest
+from telegram.error import TelegramError
 from telegram.ext import ConversationHandler
 
 from tests.fakes import (
@@ -38,7 +39,7 @@ from wgcop.keyboards import (
     REDEEM_COUNT,
     REDEEM_MEMBER,
 )
-from wgcop.store import Store, member_by_name, member_for_uid, new_member
+from wgcop.store import Store, StoreError, member_by_name, member_for_uid, new_member
 
 END = ConversationHandler.END
 NICCI = FakeUser(1002, "Nicci", "Lopez")
@@ -483,6 +484,63 @@ def test_newhome_requires_group_admin_and_join_links_users(store):
     assert member_for_uid(store.get_home(-200), 99)["name"] == "Old Timer"
     assert store.get_home(-200)["join_requests"] == {}
     assert any(s[0] == 99 and "approved" in s[1] for s in bot.sent)
+
+
+def test_deletehome_needs_admin_confirmation_and_hands_over_an_archive(store):
+    beach = FakeChat(-200, "supergroup", title="Beach House")
+    zoe, sam = FakeUser(77, "Zoe"), FakeUser(88, "Sam")
+    store.create_home(-200, "Beach", 77, "Zoe")
+    store.update(-200, lambda h: h["members"].append(new_member(h, "Sam", uid=88)))
+    store.select_home(88, -200)
+    bot = FakeBot()
+    ctx = FakeContext(bot=bot)
+
+    u = text_update("/deletehome", zoe)                       # private chat: refused
+    run(home_h.delete_home(u, ctx))
+    assert "inside the Telegram group" in u.message.last_reply
+    u = text_update("/deletehome", sam, beach)                # member, not admin
+    run(home_h.delete_home(u, FakeContext(bot=bot)))
+    assert "Only an administrator" in u.message.last_reply
+
+    u = text_update("/deletehome", zoe, beach)
+    run(home_h.delete_home(u, ctx))
+    kb = u.message.sent_messages[-1]
+    assert keyboard_labels(u.message.last_markup) == ["Yes, delete 'Beach' permanently", "Cancel"]
+    assert "2 member(s)" in u.message.last_reply
+    foreign = cb_update("home:delete:confirm", sam, kb)       # somebody else's tap
+    run(home_h.delete_home_cb(foreign, FakeContext(bot=bot)))
+    assert foreign.callback_query.answers[-1][1] is True and store.get_home(-200)["name"] == "Beach"
+    u2 = cb_update("home:delete:cancel", zoe, kb)
+    run(home_h.delete_home_cb(u2, ctx))
+    assert "Kept 'Beach'" in u2.callback_query.edits[-1][0]
+    u3 = cb_update("home:delete:confirm", zoe, kb)            # the old keyboard is dead now
+    run(home_h.delete_home_cb(u3, ctx))
+    assert u3.callback_query.answers[-1][1] is True and store.get_home(-200)["name"] == "Beach"
+
+    # confirmed: archive to the admin first, then the home and its selections are gone
+    u = text_update("/deletehome", zoe, beach)
+    run(home_h.delete_home(u, ctx))
+    u = cb_update("home:delete:confirm", zoe, u.message.sent_messages[-1])
+    run(home_h.delete_home_cb(u, ctx))
+    chat_id, filename, caption, payload = bot.documents[-1]
+    assert chat_id == 77 and filename.startswith("wg_Beach_") and "before its deletion" in caption
+    assert json.loads(payload)["home"]["name"] == "Beach"
+    with pytest.raises(StoreError):
+        store.get_home(-200)
+    assert store.selected_home(88) is None
+    assert "Home 'Beach' deleted" in u.callback_query.edits[-1][0]
+    assert home_of(store)["name"] == "WG"                     # the other home is untouched
+
+    # no archive, no deletion
+    loft = FakeChat(-300, "supergroup", title="Loft")
+    store.create_home(-300, "Loft", 77, "Zoe")
+    bot.fail_document = TelegramError("Forbidden: bot can't initiate conversation with a user")
+    u = text_update("/deletehome", zoe, loft)
+    run(home_h.delete_home(u, ctx))
+    u = cb_update("home:delete:confirm", zoe, u.message.sent_messages[-1])
+    run(home_h.delete_home_cb(u, ctx))
+    assert "nothing was deleted" in u.callback_query.edits[-1][0]
+    assert store.get_home(-300)["name"] == "Loft"
 
 
 def test_join_in_dm_uses_group_membership(store):

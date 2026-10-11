@@ -66,7 +66,16 @@ from wgcop.handlers.expense import (
     receipt_items_cb,
     start_expense,
 )
-from wgcop.handlers.home import home_select_cb, join, join_cb, newhome, on_migrate, switch_home
+from wgcop.handlers.home import (
+    delete_home,
+    delete_home_cb,
+    home_select_cb,
+    join,
+    join_cb,
+    newhome,
+    on_migrate,
+    switch_home,
+)
 from wgcop.handlers.members import (
     do_change_username,
     manage_members,
@@ -133,6 +142,7 @@ from wgcop.keyboards import (
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_SPLIT,
     HOME_SETTINGS_MENU,
+    HOME_DELETE_CALLBACK_PATTERN,
     HOME_SETTINGS_VALUE,
     JOIN_CALLBACK_PATTERN,
     MANAGE_MEMBER,
@@ -251,6 +261,7 @@ def register_handlers(app: Application) -> None:
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newhome", newhome))
+    app.add_handler(CommandHandler("deletehome", delete_home))
     app.add_handler(CommandHandler("join", join))
     app.add_handler(CommandHandler("expenses", list_expenses))
     app.add_handler(CommandHandler("chore", handle_chore))
@@ -280,6 +291,7 @@ def register_handlers(app: Application) -> None:
     # Inline callbacks outside conversations
     app.add_handler(CallbackQueryHandler(home_select_cb, pattern=f"^{re.escape(CB_HOME_SELECT)}"))
     app.add_handler(CallbackQueryHandler(join_cb, pattern=JOIN_CALLBACK_PATTERN))
+    app.add_handler(CallbackQueryHandler(delete_home_cb, pattern=HOME_DELETE_CALLBACK_PATTERN))
 
     # Stale inline keyboards (after a restart or a finished draft)
     async def _stale_cb(update: Update, context: CallbackContext) -> None:
