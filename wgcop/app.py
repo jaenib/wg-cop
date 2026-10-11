@@ -80,6 +80,7 @@ from wgcop.handlers.members import (
     do_change_username,
     manage_members,
     member_action,
+    member_add,
     modify_members,
     open_manage_self,
     set_vacation_status,
@@ -147,6 +148,7 @@ from wgcop.keyboards import (
     JOIN_CALLBACK_PATTERN,
     MANAGE_MEMBER,
     MANAGE_MEMBER_ACTION,
+    MANAGE_MEMBER_ADD,
     RECEIPT_CALLBACK_PATTERN,
     REDEEM_COUNT,
     REDEEM_MEMBER,
@@ -360,6 +362,7 @@ def _register_conversations(app: Application) -> None:
         "__entry__": manage_members,
         MANAGE_MEMBER: _text_steps(modify_members, cancel_first=False),
         MANAGE_MEMBER_ACTION: _text_steps(member_action, cancel_first=False),
+        MANAGE_MEMBER_ADD: _text_steps(member_add, cancel_first=False),
     }))
 
     app.add_handler(_conversation(BTN_CHANGE_USERNAME, {

@@ -36,6 +36,7 @@ from wgcop.keyboards import (
     EXPENSE_SPLIT,
     MANAGE_MEMBER,
     MANAGE_MEMBER_ACTION,
+    MANAGE_MEMBER_ADD,
     REDEEM_COUNT,
     REDEEM_MEMBER,
 )
@@ -294,8 +295,31 @@ def test_member_management_requires_admin_and_guards_history(store):
     assert u.message.last_reply == "Unauthorized."
 
     ctx = FakeContext()
-    assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
-    assert run(members.modify_members(text_update("Newbie", ADMIN), ctx)) == END
+    u = text_update("Member Management", ADMIN)
+    assert run(members.manage_members(u, ctx)) == MANAGE_MEMBER
+    labels = keyboard_labels(u.message.last_markup)
+    assert "Thomath Sucker" in labels and labels[-2:] == ["Add member", "Back"]
+
+    # a typo never creates a member
+    u = text_update("Tomath Sucker", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER
+    assert "Did you mean Thomath Sucker?" in u.message.last_reply
+    assert member_by_name(home_of(store), "Tomath Sucker") is None
+    u = text_update("Zorro", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER
+    assert "no member called 'Zorro'" in u.message.last_reply and "Did you mean" not in u.message.last_reply
+
+    # adding is explicit; a near-duplicate has to be confirmed
+    assert run(members.modify_members(text_update("Add member", ADMIN), ctx)) == MANAGE_MEMBER_ADD
+    u = text_update("Nicci Lopes", ADMIN)
+    assert run(members.member_add(u, ctx)) == MANAGE_MEMBER_ADD
+    assert "looks like Nicci Lopez" in u.message.last_reply
+    u = text_update("nicci lopez", ADMIN)                      # exact name: manage instead of adding
+    assert run(members.member_add(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert any("already a member" in reply[0] for reply in u.message.replies)
+    assert run(members.member_action(text_update("Back", ADMIN), ctx)) == MANAGE_MEMBER
+    run(members.modify_members(text_update("Add member", ADMIN), ctx))
+    assert run(members.member_add(text_update("Newbie", ADMIN), ctx)) == END
     assert member_by_name(home_of(store), "Newbie") is not None
 
     assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
@@ -314,6 +338,13 @@ def test_member_management_requires_admin_and_guards_history(store):
     assert keyboard_labels(u.message.last_markup) == ["Retire Newbie", "Remove Newbie", "Back"]
     assert run(members.member_action(text_update("Remove Newbie", ADMIN), ctx)) == END
     assert member_by_name(home_of(store), "Newbie") is None
+
+    # sending the near-duplicate twice adds it after all
+    run(members.manage_members(text_update("Member Management", ADMIN), ctx))
+    run(members.modify_members(text_update("Add member", ADMIN), ctx))
+    assert run(members.member_add(text_update("Nicci Lopes", ADMIN), ctx)) == MANAGE_MEMBER_ADD
+    assert run(members.member_add(text_update("Nicci Lopes", ADMIN), ctx)) == END
+    assert member_by_name(home_of(store), "Nicci Lopes") is not None
 
 
 def test_retiring_a_member_freezes_their_books_and_sends_a_farewell(store):
@@ -352,14 +383,17 @@ def test_retiring_a_member_freezes_their_books_and_sends_a_farewell(store):
 
     # a member without a Telegram link gets no note; a retired member without history can be removed
     assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
-    assert run(members.modify_members(text_update("Newbie", ADMIN), ctx)) == END
+    assert run(members.modify_members(text_update("Add member", ADMIN), ctx)) == MANAGE_MEMBER_ADD
+    assert run(members.member_add(text_update("Newbie", ADMIN), ctx)) == END
     run(members.manage_members(text_update("Member Management", ADMIN), ctx))
     run(members.modify_members(text_update("Newbie", ADMIN), ctx))
     u = text_update("Retire Newbie", ADMIN)
     assert run(members.member_action(u, ctx)) == END
     assert "no linked Telegram account" in u.message.last_reply
-    run(members.manage_members(text_update("Member Management", ADMIN), ctx))
-    u = text_update("Newbie", ADMIN)
+    u = text_update("Member Management", ADMIN)
+    run(members.manage_members(u, ctx))
+    assert "Newbie (retired)" in keyboard_labels(u.message.last_markup)
+    u = text_update("Newbie (retired)", ADMIN)                 # the tapped button label
     assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER_ACTION
     assert keyboard_labels(u.message.last_markup) == ["Remove Newbie", "Back"]
     assert "retired on" in u.message.last_reply
