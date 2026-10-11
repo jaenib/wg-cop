@@ -1,23 +1,63 @@
-name: Deploy
+name: Test and deploy
 
 on:
   push:
-    branches: ["main"]
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Check dependency and shell consistency
+        run: |
+          python -m pip check
+          bash -n deploy.sh
+          shellcheck deploy.sh
+      - name: Run isolated regression tests
+        run: |
+          python -m compileall -q maBot.py wgcop ops
+          python -m pytest -q
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: wg-cop-production
+      cancel-in-progress: false
     steps:
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
+          envs: DEPLOY_SHA
+          command_timeout: 12m
           script: |
-            set -e
+            set -eu
+            case "$DEPLOY_SHA" in
+              ''|*[!0-9a-f]*) echo "Invalid deployment revision" >&2; exit 1 ;;
+            esac
+            [ "${#DEPLOY_SHA}" -eq 40 ]
 
             run_priv() {
               if command -v sudo >/dev/null 2>&1; then
@@ -28,16 +68,38 @@ jobs:
             }
 
             cd /usr/bots/wg_cop
-            git config --global --get-all safe.directory | grep -Fxq /usr/bots/wg_cop || \
-              git config --global --add safe.directory /usr/bots/wg_cop
-            git fetch origin main
-            git checkout -f main
-            git reset --hard origin/main
-            git clean -fd -e 'wg_data_*.json*' -e 'bot_persistence.pkl' -e 'config.py' -e '.secrets/' -e 'config_beta.py' -e 'backups/'
+            git -c safe.directory=/usr/bots/wg_cop fetch origin main
+            # An older queued workflow must never roll production back past main.
+            if [ "$(git -c safe.directory=/usr/bots/wg_cop rev-parse origin/main)" != "$DEPLOY_SHA" ]; then
+              echo "A newer main revision exists; skipping superseded deployment."
+              exit 0
+            fi
+            previous_sha=$(git -c safe.directory=/usr/bots/wg_cop rev-parse HEAD)
+            git -c safe.directory=/usr/bots/wg_cop checkout -f -B main "$DEPLOY_SHA"
+            # Do not clean untracked files: this checkout contains live state,
+            # private config, the venv, and migration/restore archives.
+            restore_code() {
+              status=$?
+              if [ "$status" -ne 0 ]; then
+                git -c safe.directory=/usr/bots/wg_cop reset --hard "$previous_sha"
+                echo "Pre-restart checks failed; restored code to $previous_sha." >&2
+              fi
+              exit "$status"
+            }
+            trap restore_code EXIT
 
             if [ ! -x ./venv/bin/python ]; then
               python3 -m venv venv
             fi
-            ./venv/bin/python -m pip install -q --upgrade pip
-            ./venv/bin/python -m pip install -q -r requirements.txt
+            ./venv/bin/python -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ required"'
+            ./venv/bin/python -m pip install -q -r requirements-dev.txt
+            ./venv/bin/python -m pip check
+            bash -n deploy.sh
+            ./venv/bin/python -m compileall -q maBot.py wgcop ops
+            ./venv/bin/python -m pytest -q
+            # From this point startup can migrate data. A code-only rollback is
+            # unsafe; preserve the failed revision for explicit recovery.
+            trap - EXIT
             run_priv systemctl restart wg_cop
+            sleep 5
+            run_priv systemctl is-active --quiet wg_cop

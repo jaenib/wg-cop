@@ -1,4 +1,4 @@
-python-telegram-bot>=20.0
-python-telegram-bot[job-queue]
-pytz
-openai
+# Python 3.10+; keep direct dependencies aligned with the tested production stack.
+python-telegram-bot[job-queue]==22.7
+pytz==2025.2
+openai==2.36.0
