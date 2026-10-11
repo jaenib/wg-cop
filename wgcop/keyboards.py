@@ -10,7 +10,7 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 
-from wgcop.members import _get_member_name, _get_member_status
+from wgcop.members import _get_member_name, _get_member_status, active_members
 
 # ----------------------------------------------------------------- labels
 BTN_ADD_EXPENSE = "Add Expense"
@@ -108,7 +108,7 @@ EXPENSE_LIST_LIMIT = 20
     EXPENSE_RECEIPT_REVIEW,
 ) = range(7)
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
-MANAGE_MEMBER = 0
+MANAGE_MEMBER, MANAGE_MEMBER_ACTION = range(2)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
 ADMIN_PENALTY_MEMBER, ADMIN_PENALTY_COUNT = range(2)
@@ -141,7 +141,7 @@ def get_cancel_keyboard():
 
 
 def get_member_keyboard(home):
-    members = home.get("members", [])
+    members = active_members(home)
     if not members:
         return None
     buttons = [[KeyboardButton(_get_member_name(member))] for member in members]
@@ -255,6 +255,8 @@ def _truncate_button_label(label: str, limit: int = 60) -> str:
 def build_payer_inline_kb(members):
     rows = []
     for m in members:
+        if _get_member_status(m) == "retired":
+            continue
         rows.append(
             [InlineKeyboardButton(_truncate_button_label(_get_member_name(m)), callback_data=f"{CB_PAYER_PREFIX}{m['mid']}")]
         )
@@ -264,6 +266,7 @@ def build_payer_inline_kb(members):
 def build_split_inline_kb(members, selected_mids):
     """Active members first, vacating members last, then All / Back / Done / Cancel."""
     selected = set(selected_mids or ())
+    members = [m for m in members if _get_member_status(m) != "retired"]
     active = [m for m in members if _get_member_status(m) != "vacating"]
     vacating = [m for m in members if _get_member_status(m) == "vacating"]
 

@@ -41,14 +41,16 @@ from wgcop.homes import (
     remove_member,
     request_claim,
     require_admin,
+    retire_member,
     require_home,
     resolve_home,
     role_holders,
     set_single_role,
     start_flow,
+    unclaimed_members,
     unlink_member,
 )
-from wgcop.store import Store, member_for_uid
+from wgcop.store import Store, member_for_uid, validate_home
 
 NICCI = FakeUser(1002, "Nicci", "Lopez")
 STRANGER = FakeUser(4242, "Sam")
@@ -225,17 +227,52 @@ def test_link_and_unlink_guard_conflicts(store):
 
 def test_remove_member_refuses_when_history_exists(store):
     home = store.get_home(LEGACY_GROUP_ID)
-    with pytest.raises(HomeError, match="Unlink"):
+    with pytest.raises(HomeError, match="Retire"):
         remove_member(home, home["members"][0]["mid"])
     fresh = join_as_new_member(home, Caller(4242, "Temp"))
     assert not member_has_history(home, fresh)
     home["chores"]["temp"] = 2  # legacy free-text key, different casing
     assert member_has_history(home, fresh)
-    with pytest.raises(HomeError, match="Unlink"):
+    with pytest.raises(HomeError, match="Retire"):
         remove_member(home, fresh["mid"])
     del home["chores"]["temp"]
     remove_member(home, fresh["mid"])
     assert member_for_uid(home, 4242) is None
+
+
+def test_retire_member_freezes_record_and_drops_links_and_roles(store):
+    home = store.get_home(LEGACY_GROUP_ID)
+    thomath = member_for_uid(home, 1005)
+    set_single_role(home, "chronicler", 1005)
+    home["last_week_violators"]["thomath sucker"] = True
+    home["join_requests"]["1005"] = {"mid": thomath["mid"]}
+
+    member, former_uid = retire_member(home, thomath["mid"])
+    assert member is thomath and former_uid == 1005
+    assert member["status"] == "retired" and member["retired_uid"] == 1005 and "uid" not in member
+    assert len(member["retired_at"]) >= 10
+    assert home["roles"]["chronicler"] is None
+    assert "thomath sucker" not in home["last_week_violators"] and "1005" not in home["join_requests"]
+    assert member_for_uid(home, 1005) is None
+    assert thomath not in unclaimed_members(home)
+    assert home["chores"]["Thomath Sucker"] == 9                      # the books are untouched
+    validate_home(home)
+
+    with pytest.raises(HomeError, match="retired"):
+        link_member(home, thomath["mid"], 4242)
+    with pytest.raises(HomeError, match="retired"):
+        request_claim(home, Caller(4242, "Sam"), thomath["mid"])
+    with pytest.raises(HomeError, match="already retired"):
+        retire_member(home, thomath["mid"])
+
+    # the only administrator stays until someone else administers the home
+    admin = join_as_new_member(home, Caller(1001, "Admin"))
+    with pytest.raises(HomeError, match="only administrator"):
+        retire_member(home, admin["mid"])
+    add_admin(home, 4343)
+    retire_member(home, admin["mid"])
+    assert home["roles"]["admins"] == [4343] and home["roles"]["handler"] is None
+    validate_home(home)
 
 
 # --------------------------------------------------------- telegram checks

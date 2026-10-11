@@ -1,55 +1,106 @@
-"""Member management (admin), own profile, username change and vacation status."""
+"""Member management (admin: add, retire, remove), own profile, username change and vacation status."""
+import logging
+
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import CallbackContext, ConversationHandler
 
+from wgcop.formatting import format_currency, format_signed_currency
 from wgcop.handlers.common import admin_home, cancel, continue_admin_flow, continue_flow
-from wgcop.homes import HomeError, end_flow, remove_member, require_home, start_flow
+from wgcop.homes import (
+    HomeError,
+    end_flow,
+    home_currency,
+    member_has_history,
+    remove_member,
+    require_home,
+    retire_member,
+    start_flow,
+)
 from wgcop.keyboards import (
     CHANGE_USERNAME_NEW,
     MANAGE_MEMBER,
+    MANAGE_MEMBER_ACTION,
     get_cancel_keyboard,
     get_main_keyboard,
     get_manage_self_keyboard,
 )
-from wgcop.members import _match_member_name, _rename_member_in_data
-from wgcop.store import get_store, member_by_name, member_for_uid, new_member
+from wgcop.members import _match_member_name, _rename_member_in_data, member_stats
+from wgcop.store import get_store, member_by_mid, member_by_name, member_for_uid, new_member
+
+logger = logging.getLogger(__name__)
 
 MAX_NAME_LEN = 40
+BTN_MEMBERS_BACK = "Back"
 
 
 def _member_summary(home) -> str:
     parts = []
     for m in home["members"]:
         flags = []
-        if m.get("status") == "vacating":
-            flags.append("vacating")
-        flags.append("linked" if m.get("uid") else "not linked")
+        if m.get("status") == "retired":
+            flags.append("retired")
+        else:
+            if m.get("status") == "vacating":
+                flags.append("vacating")
+            flags.append("linked" if m.get("uid") else "not linked")
         parts.append(f"{m['name']} ({', '.join(flags)})")
     return ", ".join(parts)
 
 
+def _stats_line(stats, currency) -> str:
+    return (
+        f"{stats['expenses_paid']} expense(s) paid ({format_currency(stats['amount_paid'], currency)}), "
+        f"{stats['chore_points']} chore point(s), balance {format_signed_currency(stats['balance'], currency)}"
+    )
+
+
+def farewell_text(home, member, stats) -> str:
+    currency = home_currency(home)
+    balance = stats["balance"]
+    if balance > 0.004:
+        settle = "the house still owes you this"
+    elif balance < -0.004:
+        settle = "you still owe the house this"
+    else:
+        settle = "all square"
+    return (
+        f"Farewell from '{home['name']}' \U0001F44B\n\n"
+        "An administrator has retired you from the household books, so your record is frozen as it stands:\n"
+        f"  \u2022 {stats['expenses_paid']} expense(s) paid, {format_currency(stats['amount_paid'], currency)} in total\n"
+        f"  \u2022 {stats['chore_points']} chore point(s)\n"
+        f"  \u2022 final balance: {format_signed_currency(balance, currency)} ({settle})\n\n"
+        "Thank you for your bookkeeping and for keeping the house running. "
+        "Any open balance is settled between you and the house outside the bot. All the best!"
+    )
+
+
 # ------------------------------------------------------------ admin: members
+async def _show_member_list(message, home) -> int:
+    if home["members"]:
+        txt = (
+            f"Current members: {_member_summary(home)}\n\n"
+            "Send a new name to add a member, or an existing name to manage that member (retire or remove).\n"
+            "Or type 'Back' to return."
+        )
+    else:
+        txt = "No members yet. Send a name to add. Or type 'Back' to return."
+    await message.reply_text(
+        txt, reply_markup=ReplyKeyboardMarkup([[KeyboardButton(BTN_MEMBERS_BACK)]], resize_keyboard=True)
+    )
+    return MANAGE_MEMBER
+
+
 async def manage_members(update: Update, context: CallbackContext) -> int:
     home = await admin_home(update, context)
     if home is None:
         return ConversationHandler.END
     start_flow(context, update.effective_chat.id, home)
-    if home["members"]:
-        txt = (
-            f"Current members: {_member_summary(home)}\n\n"
-            "Send a name to add it, or an existing name to remove it "
-            "(members with bookkeeping history cannot be removed).\n"
-            "Or type 'Back' to return without changes."
-        )
-    else:
-        txt = "No members yet. Send a name to add. Or type 'Back' to return."
-    await update.message.reply_text(
-        txt, reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Back")]], resize_keyboard=True)
-    )
-    return MANAGE_MEMBER
+    return await _show_member_list(update.message, home)
 
 
 async def modify_members(update: Update, context: CallbackContext) -> int:
+    """A new name adds a member; an existing name opens that member's actions."""
     home, flow = await continue_admin_flow(update, context)
     if home is None:
         return ConversationHandler.END
@@ -62,21 +113,96 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text(f"Names are limited to {MAX_NAME_LEN} characters.")
         return MANAGE_MEMBER
 
-    def apply(h):
-        current = member_by_name(h, text)
-        if current is not None:
-            removed = remove_member(h, current["mid"])
-            return f"Removed {removed['name']} from the household."
-        h["members"].append(new_member(h, text))
-        return f"Added {text} to the household."
+    member = member_by_name(home, text)
+    if member is None:
+        get_store().update(home["id"], lambda h: h["members"].append(new_member(h, text)))
+        end_flow(context, update.effective_chat.id)
+        await update.message.reply_text(f"Added {text} to the household.", reply_markup=get_main_keyboard())
+        return ConversationHandler.END
 
+    flow["manage_mid"] = member["mid"]
+    name = member["name"]
+    retired = member.get("status") == "retired"
+    history = member_has_history(home, member)
+    rows, hints = [], []
+    if retired:
+        intro = f"{name} retired on {str(member.get('retired_at') or '')[:10]}; their records are frozen."
+    else:
+        intro = f"{name}: {_stats_line(member_stats(home, member), home_currency(home))}."
+        rows.append([KeyboardButton(f"Retire {name}")])
+        hints.append(
+            "Retire: keeps their bookkeeping frozen, takes them out of every menu, standing and report, "
+            "unlinks their Telegram account and sends them a farewell note."
+        )
+    if history:
+        hints.append("Remove is not offered because they appear in expenses, chores or penalties.")
+    else:
+        rows.append([KeyboardButton(f"Remove {name}")])
+        hints.append("Remove: deletes the profile (no bookkeeping references it).")
+    rows.append([KeyboardButton(BTN_MEMBERS_BACK)])
+    await update.message.reply_text(
+        intro + "\n\n" + "\n".join(hints), reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    )
+    return MANAGE_MEMBER_ACTION
+
+
+async def member_action(update: Update, context: CallbackContext) -> int:
+    home, flow = await continue_admin_flow(update, context)
+    if home is None:
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    if text.lower() == "cancel":
+        end_flow(context, update.effective_chat.id)
+        await update.message.reply_text("Member management closed.", reply_markup=get_main_keyboard())
+        return ConversationHandler.END
+    if text.lower() == "back":
+        flow.pop("manage_mid", None)
+        return await _show_member_list(update.message, home)
+    member = member_by_mid(home, flow.get("manage_mid"))
+    if member is None:
+        flow.pop("manage_mid", None)
+        await update.message.reply_text("That member no longer exists.")
+        return await _show_member_list(update.message, home)
+    name = member["name"]
+    if text.casefold() == f"Retire {name}".casefold():
+        return await _retire(update, context, home, member)
+    if text.casefold() == f"Remove {name}".casefold():
+        try:
+            get_store().update(home["id"], lambda h: remove_member(h, member["mid"]))
+        except HomeError as exc:
+            await update.message.reply_text(str(exc))
+            return MANAGE_MEMBER_ACTION
+        end_flow(context, update.effective_chat.id)
+        await update.message.reply_text(f"Removed {name} from the household.", reply_markup=get_main_keyboard())
+        return ConversationHandler.END
+    await update.message.reply_text("Please use the buttons: Retire, Remove or Back.")
+    return MANAGE_MEMBER_ACTION
+
+
+async def _retire(update: Update, context: CallbackContext, home, member) -> int:
+    stats = member_stats(home, member)  # retirement changes no numbers, so this is the frozen record
     try:
-        _, response = get_store().update(home["id"], apply)
+        _, (retired, former_uid) = get_store().update(home["id"], lambda h: retire_member(h, member["mid"]))
     except HomeError as exc:
         await update.message.reply_text(str(exc))
-        return MANAGE_MEMBER
+        return MANAGE_MEMBER_ACTION
     end_flow(context, update.effective_chat.id)
-    await update.message.reply_text(response, reply_markup=get_main_keyboard())
+    name = retired["name"]
+    if former_uid is None:
+        note = f"{name} has no linked Telegram account, so no farewell note was sent."
+    else:
+        try:
+            await context.bot.send_message(chat_id=former_uid, text=farewell_text(home, retired, stats))
+            note = f"A farewell note was sent to {name}."
+        except TelegramError as exc:
+            logger.info("Home %s: farewell note to %s failed: %s", home["id"], former_uid, exc)
+            note = f"The farewell note could not be delivered to {name} ({exc})."
+    await update.message.reply_text(
+        f"Retired {name}. Their records stay in the books, frozen: {_stats_line(stats, home_currency(home))}.\n"
+        "They no longer appear in menus, standings or reports, and their Telegram link was removed.\n"
+        + note,
+        reply_markup=get_main_keyboard(),
+    )
     return ConversationHandler.END
 
 
@@ -164,6 +290,8 @@ async def set_vacation_status(update: Update, context: CallbackContext) -> None:
     def apply(h):
         for m in h["members"]:
             if m["mid"] == mid:
+                if m.get("status") == "retired":
+                    return m["name"], "retired"
                 m["status"] = "vacating" if m.get("status", "active") == "active" else "active"
                 return m["name"], m["status"]
         return None, None
@@ -172,6 +300,8 @@ async def set_vacation_status(update: Update, context: CallbackContext) -> None:
     reply_kb = get_main_keyboard() if context.args else get_manage_self_keyboard()
     if new_status is None:
         await update.message.reply_text("That member no longer exists.", reply_markup=reply_kb)
+    elif new_status == "retired":
+        await update.message.reply_text(f"{name} has retired from this home; their record is frozen.", reply_markup=reply_kb)
     elif new_status == "vacating":
         await update.message.reply_text(
             f"{name} is now on vacation and will appear at the bottom when selecting splitters, "

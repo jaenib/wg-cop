@@ -5,7 +5,7 @@ from telegram.ext import CallbackContext, ConversationHandler
 from wgcop.handlers.common import cancel, continue_flow
 from wgcop.homes import end_flow, require_home, start_flow
 from wgcop.keyboards import REDEEM_COUNT, REDEEM_MEMBER, get_cancel_keyboard, get_penalties_keyboard
-from wgcop.members import _match_member_name, chore_points_by_member
+from wgcop.members import _match_member_name, _normalise_member_name, active_members, chore_points_by_member
 from wgcop.reports import penalty_threshold, penalty_unit
 from wgcop.store import get_store
 
@@ -31,8 +31,9 @@ def penalty_lines(home) -> list[str]:
                 lines.append(f"{member} owes {owed} {unit}(s) ({gap} pts behind {leader_name}).")
             else:
                 lines.append(f"{member} is {gap} pts behind {leader_name} (warning).")
+    active_norm = {_normalise_member_name(m) for m in active_members(home)}
     for member, owed in penalties.items():
-        if owed > 0 and member not in currently_lagging:
+        if owed > 0 and member not in currently_lagging and _normalise_member_name(member) in active_norm:
             lines.append(f"{member} still owes {owed} {unit}(s) (caught up, debt remains).")
     return lines
 
@@ -57,7 +58,8 @@ async def redeem_start(update: Update, context: CallbackContext) -> int:
     if home is None:
         return ConversationHandler.END
     penalties = home.get("penalties", {}) or {}
-    owing = {k: v for k, v in penalties.items() if v > 0}
+    active = active_members(home)
+    owing = {k: v for k, v in penalties.items() if v > 0 and _match_member_name(active, k)}
     if not owing:
         await update.message.reply_text("Nobody owes any penalties right now.", reply_markup=get_penalties_keyboard())
         return ConversationHandler.END
@@ -79,7 +81,7 @@ async def redeem_member(update: Update, context: CallbackContext) -> int:
     chosen = update.message.text.strip()
     if chosen.lower() == "cancel":
         return await cancel(update, context)
-    matched = _match_member_name(home["members"], chosen)
+    matched = _match_member_name(active_members(home), chosen)
     if not matched:
         await update.message.reply_text("Member not found. Please pick a name from the keyboard.")
         return REDEEM_MEMBER

@@ -33,6 +33,37 @@ def _get_member_status(member):
     return "active"
 
 
+def _is_retired(member) -> bool:
+    return _get_member_status(member) == "retired"
+
+
+def active_members(data) -> list:
+    """Members who still take part: everyone except retired ones (whose records stay frozen)."""
+    return [m for m in (data.get("members", []) or []) if not _is_retired(m)]
+
+
+def member_stats(data, member) -> dict:
+    """One member's bookkeeping totals: expenses paid and their sum, chore points, balance."""
+    name = _get_member_name(member)
+    norm = _normalise_member_name(name)
+    paid = [e for e in (data.get("expenses", []) or []) if _normalise_member_name(e.get("payer")) == norm]
+    amount_paid = 0.0
+    for expense in paid:
+        try:
+            amount_paid += float(expense.get("amount", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    points = sum(
+        int(p or 0) for raw, p in (data.get("chores", {}) or {}).items() if _normalise_member_name(raw) == norm
+    )
+    return {
+        "expenses_paid": len(paid),
+        "amount_paid": round(amount_paid, 2),
+        "chore_points": points,
+        "balance": round(calculate_balances(data).get(name, 0.0), 2),
+    }
+
+
 def _member_to_dict(member_name: str):
     """Convert a member name to a member object."""
     return {"name": member_name, "status": "active"}
@@ -79,8 +110,8 @@ def calculate_balances(data):
 
 
 def chore_points_by_member(data) -> dict:
-    """Chore totals keyed by the member's canonical display name (unknown names dropped)."""
-    members = data.get("members", []) or []
+    """Chore totals keyed by the member's canonical display name (unknown and retired names dropped)."""
+    members = active_members(data)
     totals = {}
     for raw_name, points in (data.get("chores", {}) or {}).items():
         matched = _match_member_name(members, raw_name)

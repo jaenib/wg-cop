@@ -19,6 +19,7 @@ from tests.legacy_fixture import LEGACY_GROUP_ID, legacy_data, legacy_seed
 from wgcop import store as store_mod
 from wgcop.handlers import admin, chore, edit, expense, home as home_h, members, penalties, views
 from wgcop.handlers.common import open_settings, start
+from wgcop.reports import _build_weekly_report
 from wgcop.keyboards import (
     CHORE_DESCRIPTION,
     CHORE_MINUTES,
@@ -33,6 +34,7 @@ from wgcop.keyboards import (
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_SPLIT,
     MANAGE_MEMBER,
+    MANAGE_MEMBER_ACTION,
     REDEEM_COUNT,
     REDEEM_MEMBER,
 )
@@ -297,9 +299,70 @@ def test_member_management_requires_admin_and_guards_history(store):
 
     assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
     u = text_update("General Guysan", ADMIN)
-    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER
-    assert "Unlink" in u.message.last_reply
-    assert run(members.modify_members(text_update("newbie", ADMIN), ctx)) == END
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert keyboard_labels(u.message.last_markup) == ["Retire General Guysan", "Back"]  # history: no Remove
+    assert "expense(s) paid" in u.message.last_reply
+    u = text_update("Remove General Guysan", ADMIN)             # typed anyway
+    assert run(members.member_action(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert "Retire them instead" in u.message.last_reply
+    u = text_update("Back", ADMIN)
+    assert run(members.member_action(u, ctx)) == MANAGE_MEMBER
+    assert "Current members" in u.message.last_reply
+    u = text_update("newbie", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert keyboard_labels(u.message.last_markup) == ["Retire Newbie", "Remove Newbie", "Back"]
+    assert run(members.member_action(text_update("Remove Newbie", ADMIN), ctx)) == END
+    assert member_by_name(home_of(store), "Newbie") is None
+
+
+def test_retiring_a_member_freezes_their_books_and_sends_a_farewell(store):
+    bot = FakeBot()
+    ctx = FakeContext(bot=bot)
+    assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
+    u = text_update("thomath sucker", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert keyboard_labels(u.message.last_markup) == ["Retire Thomath Sucker", "Back"]
+    u = text_update("Retire Thomath Sucker", ADMIN)
+    assert run(members.member_action(u, ctx)) == END
+    assert "Retired Thomath Sucker" in u.message.last_reply and "farewell note was sent" in u.message.last_reply
+
+    home = home_of(store)
+    thomath = member_by_name(home, "Thomath Sucker")
+    assert thomath["status"] == "retired" and "uid" not in thomath and thomath["retired_uid"] == 1005
+    assert member_for_uid(home, 1005) is None
+    assert home["chores"]["Thomath Sucker"] == 9                              # frozen, not deleted
+    assert any(e["payer"] == "Thomath Sucker" for e in home["expenses"])
+    farewell = [s for s in bot.sent if s[0] == 1005][-1][1]
+    assert "Farewell from 'WG'" in farewell and "Thank you for your bookkeeping" in farewell
+    assert "9 chore point(s)" in farewell and "final balance: CHF" in farewell
+
+    # gone from menus, standings and the weekly report; listed as retired
+    u = text_update("Add Chore", NICCI)
+    run(chore.start_chore(u, ctx))
+    assert "Thomath Sucker" not in keyboard_labels(u.message.last_markup)
+    u = text_update("Standings", NICCI)
+    run(views.standings(u, ctx))
+    assert "Retired (records frozen):" in u.message.last_reply and "Thomath Sucker: 9 points" in u.message.last_reply
+    assert u.message.last_reply.index("Retired") > u.message.last_reply.index("Nicci Lopez")
+    assert "Thomath" not in _build_weekly_report(home_of(store))
+    u = text_update("/setstatus Thomath Sucker", NICCI)
+    run(members.set_vacation_status(u, FakeContext(args=["Thomath", "Sucker"])))
+    assert "has retired" in u.message.last_reply
+
+    # a member without a Telegram link gets no note; a retired member without history can be removed
+    assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
+    assert run(members.modify_members(text_update("Newbie", ADMIN), ctx)) == END
+    run(members.manage_members(text_update("Member Management", ADMIN), ctx))
+    run(members.modify_members(text_update("Newbie", ADMIN), ctx))
+    u = text_update("Retire Newbie", ADMIN)
+    assert run(members.member_action(u, ctx)) == END
+    assert "no linked Telegram account" in u.message.last_reply
+    run(members.manage_members(text_update("Member Management", ADMIN), ctx))
+    u = text_update("Newbie", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert keyboard_labels(u.message.last_markup) == ["Remove Newbie", "Back"]
+    assert "retired on" in u.message.last_reply
+    assert run(members.member_action(text_update("Remove Newbie", ADMIN), ctx)) == END
     assert member_by_name(home_of(store), "Newbie") is None
 
 

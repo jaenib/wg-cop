@@ -70,6 +70,7 @@ from wgcop.handlers.home import home_select_cb, join, join_cb, newhome, on_migra
 from wgcop.handlers.members import (
     do_change_username,
     manage_members,
+    member_action,
     modify_members,
     open_manage_self,
     set_vacation_status,
@@ -135,6 +136,7 @@ from wgcop.keyboards import (
     HOME_SETTINGS_VALUE,
     JOIN_CALLBACK_PATTERN,
     MANAGE_MEMBER,
+    MANAGE_MEMBER_ACTION,
     RECEIPT_CALLBACK_PATTERN,
     REDEEM_COUNT,
     REDEEM_MEMBER,
@@ -345,6 +347,7 @@ def _register_conversations(app: Application) -> None:
     app.add_handler(_conversation(BTN_MEMBER_MANAGEMENT, {
         "__entry__": manage_members,
         MANAGE_MEMBER: _text_steps(modify_members, cancel_first=False),
+        MANAGE_MEMBER_ACTION: _text_steps(member_action, cancel_first=False),
     }))
 
     app.add_handler(_conversation(BTN_CHANGE_USERNAME, {

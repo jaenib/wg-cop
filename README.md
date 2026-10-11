@@ -86,9 +86,14 @@ edit or restart is involved.
   (default "beer"). Changes apply immediately.
 - **Manage Weekly Report**: report time, on/off, and a dry run of this week's
   report. **Set WG-Höck** stores the next house-meeting date. **Adjust
-  Penalties** corrects a member's debt. **Member Management** adds profiles or
-  removes ones without bookkeeping history. **System Overview** shows a
-  sanitized status of the home, storage and jobs.
+  Penalties** corrects a member's debt. **Member Management** adds profiles,
+  removes ones without bookkeeping history, and *retires* a member who moved
+  out: send their name, then tap *Retire*. Their expenses, chore points and
+  balance stay in the books frozen (shown under "Retired" in Standings), they
+  disappear from every menu, standing and report, their Telegram link is
+  removed, and they receive a farewell note by DM with their totals. A retired
+  member can still be removed later if nothing in the books references them.
+  **System Overview** shows a sanitized status of the home, storage and jobs.
 
 ## Scheduled jobs
 

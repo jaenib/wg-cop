@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 
 import pytz
 
-from wgcop.members import _get_member_name, _normalise_member_name
+from wgcop.members import _get_member_name, _normalise_member_name, active_members
 
 logger = logging.getLogger(__name__)
 
@@ -212,13 +212,13 @@ def _build_weekly_report(data, reference=None):
 
     chores_normalized = {}
     for chore_user, points in (data.get("chores") or {}).items():
-        for member in data.get("members") or []:
+        for member in active_members(data):
             member_name = _get_member_name(member)
             if _normalise_member_name(member_name) == _normalise_member_name(chore_user):
                 chores_normalized[member_name] = chores_normalized.get(member_name, 0) + points
                 break
 
-    member_names = [_get_member_name(m) for m in (data.get("members") or [])]
+    member_names = [_get_member_name(m) for m in active_members(data)]
     leaderboard = sorted(
         [(name, chores_normalized.get(name, 0)) for name in member_names],
         key=lambda x: -x[1],
@@ -254,8 +254,9 @@ def _build_weekly_report(data, reference=None):
             comeback_kids.append(member)
 
     penalties = data.get("penalties", {}) or {}
+    active_norm = {_normalise_member_name(name) for name in member_names}
     for member, owed in penalties.items():
-        if owed > 0 and member not in currently_penalised:
+        if owed > 0 and member not in currently_penalised and _normalise_member_name(member) in active_norm:
             penalty_lines.append(f"  • {member} still owes {owed} {unit}(s) (caught up, debt remains).")
 
     if penalty_lines:

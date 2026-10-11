@@ -35,6 +35,7 @@ from wgcop.keyboards import (
     get_main_keyboard,
     get_roles_keyboard,
 )
+from wgcop.members import active_members
 from wgcop.store import get_store, member_by_mid, member_for_uid
 
 
@@ -48,8 +49,9 @@ def roles_summary(home) -> str:
     admins = ", ".join(_name_for_uid(home, uid) for uid in roles.get("admins", [])) or "(none)"
     chron = _name_for_uid(home, roles["chronicler"]) if roles.get("chronicler") else "not set"
     handler = _name_for_uid(home, roles["handler"]) if roles.get("handler") else "not set"
-    linked = [m["name"] for m in home["members"] if m.get("uid")]
-    unlinked = [m["name"] for m in home["members"] if not m.get("uid")]
+    linked = [m["name"] for m in active_members(home) if m.get("uid")]
+    unlinked = [m["name"] for m in active_members(home) if not m.get("uid")]
+    retired = [m["name"] for m in home["members"] if m.get("status") == "retired"]
     pending = len(home.get("join_requests") or {})
     return "\n".join(
         [
@@ -59,6 +61,7 @@ def roles_summary(home) -> str:
             f"  Handler (receives heartbeats): {handler}",
             f"  Linked members: {', '.join(linked) or '(none)'}",
             f"  Not linked yet: {', '.join(unlinked) or '(none)'}",
+            *([f"  Retired: {', '.join(retired)}"] if retired else []),
             f"  Pending join requests: {pending}",
         ]
     )
@@ -74,7 +77,7 @@ async def open_roles(update: Update, context: CallbackContext) -> int:
 
 
 def _linked_members(home):
-    return [m for m in home["members"] if m.get("uid")]
+    return [m for m in active_members(home) if m.get("uid")]
 
 
 async def roles_menu(update: Update, context: CallbackContext) -> int:

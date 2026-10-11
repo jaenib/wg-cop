@@ -20,7 +20,7 @@ from wgcop.keyboards import (
     get_cancel_keyboard,
     get_weekly_report_keyboard,
 )
-from wgcop.members import _match_member_name
+from wgcop.members import _match_member_name, active_members
 from wgcop.receipts import _openai_lib
 from wgcop.reports import _build_weekly_report, _get_chronicler_meta, _get_weekly_report_meta, penalty_unit
 from wgcop.store import get_store
@@ -63,6 +63,7 @@ async def admin_system_overview(update: Update, context: CallbackContext) -> Non
     members = home.get("members", []) or []
     active = sum(1 for m in members if m.get("status") == "active")
     vacating = sum(1 for m in members if m.get("status") == "vacating")
+    retired = sum(1 for m in members if m.get("status") == "retired")
     linked = sum(1 for m in members if m.get("uid"))
 
     expenses = home.get("expenses", []) or []
@@ -126,7 +127,7 @@ async def admin_system_overview(update: Update, context: CallbackContext) -> Non
         f"  - persistence: {_file_overview('bot_persistence.pkl', tz)}",
         "",
         "Dataset Counters (aggregated only):",
-        f"  - members: {len(members)} (active={active}, vacating={vacating}, linked={linked})",
+        f"  - members: {len(members)} (active={active}, vacating={vacating}, retired={retired}, linked={linked})",
         f"  - expenses: {len(expenses)} entries, total={expense_total:.2f}, receipt_entries={receipt_expenses}, receipt_line_items={receipt_items_total}",
         f"  - chore totals map: {len(home.get('chores') or {})} members, cumulative_points={total_chore_points}",
         f"  - chore log entries: {len(home.get('chore_log', []) or [])}",
@@ -225,7 +226,7 @@ async def admin_penalty_start(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
     start_flow(context, update.effective_chat.id, home)
     penalties = home.get("penalties", {}) or {}
-    buttons = [[KeyboardButton(f"{m['name']} ({penalties.get(m['name'], 0)})")] for m in home["members"]]
+    buttons = [[KeyboardButton(f"{m['name']} ({penalties.get(m['name'], 0)})")] for m in active_members(home)]
     buttons.append([KeyboardButton("Cancel")])
     await update.message.reply_text(
         f"Select member to adjust {penalty_unit(home)} count (current count shown):",
@@ -243,7 +244,7 @@ async def admin_penalty_member(update: Update, context: CallbackContext) -> int:
         return await cancel(update, context)
     if " (" in text and text.endswith(")"):
         text = text.rsplit(" (", 1)[0]
-    matched = _match_member_name(home["members"], text)
+    matched = _match_member_name(active_members(home), text)
     if not matched:
         await update.message.reply_text("Member not found. Please pick from the keyboard.")
         return ADMIN_PENALTY_MEMBER
