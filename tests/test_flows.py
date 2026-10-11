@@ -30,6 +30,7 @@ from wgcop.keyboards import (
     EXPENSE_DESCRIPTION,
     EXPENSE_MODE,
     EXPENSE_PAYER,
+    EXPENSE_RECEIPT_REVIEW,
     EXPENSE_SPLIT,
     MANAGE_MEMBER,
     REDEEM_COUNT,
@@ -121,6 +122,47 @@ def test_split_all_and_cancel(store):
     assert len(home_of(store)["expenses"]) == 4
 
 
+def test_receipt_review_refuses_empty_and_non_positive_selections(store):
+    store.update(LEGACY_GROUP_ID, lambda h: h["settings"].__setitem__("currency", "EUR"))
+    ctx = FakeContext()
+    run(expense.start_expense(text_update("Add Expense", NICCI), ctx))
+    run(expense.expense_mode_selection(text_update("Scan Receipt", NICCI), ctx))
+    flow = ctx.user_data[f"flow:{NICCI.id}"]
+    # what expense_receipt_photo stores after a parse (a discount line is kept on purpose)
+    review = text_update("parse summary", NICCI).message
+    flow.update(mode="receipt", receipt_items=[{"name": "milk", "amount": 4.0}, {"name": "discount", "amount": -1.0}],
+                receipt_total=None, kb_msg=review.message_id)
+
+    u = cb_update("receipt_accept", NICCI, review)
+    assert run(expense.receipt_items_cb(u, ctx)) == EXPENSE_RECEIPT_REVIEW
+    assert flow["receipt_selected"] == [0, 1] and flow["amount"] == 3.0
+    assert "Shared total: EUR 3.00" in u.callback_query.edits[-1][0]
+
+    # untoggling everything must not silently re-select every item
+    run(expense.receipt_items_cb(cb_update("receipt_toggle:0", NICCI, review), ctx))
+    u = cb_update("receipt_toggle:1", NICCI, review)
+    run(expense.receipt_items_cb(u, ctx))
+    assert flow["receipt_selected"] == [] and "EUR 0.00" in u.callback_query.edits[-1][0]
+    u = cb_update("receipt_done", NICCI, review)
+    assert run(expense.receipt_items_cb(u, ctx)) == EXPENSE_RECEIPT_REVIEW
+    assert u.callback_query.answers == [("Select at least one item.", True)]
+
+    # only the discount selected: a non-positive total is refused
+    run(expense.receipt_items_cb(cb_update("receipt_toggle:1", NICCI, review), ctx))
+    u = cb_update("receipt_done", NICCI, review)
+    assert run(expense.receipt_items_cb(u, ctx)) == EXPENSE_RECEIPT_REVIEW
+    assert u.callback_query.answers[-1][1] is True and "more than zero" in u.callback_query.answers[-1][0]
+    assert "amount" not in flow or flow["amount"] == 3.0  # the accepted total, nothing new stored
+
+    # milk alone goes through
+    run(expense.receipt_items_cb(cb_update("receipt_toggle:0", NICCI, review), ctx))
+    run(expense.receipt_items_cb(cb_update("receipt_toggle:1", NICCI, review), ctx))
+    u = cb_update("receipt_done", NICCI, review)
+    assert run(expense.receipt_items_cb(u, ctx)) == EXPENSE_DESCRIPTION
+    assert flow["amount"] == 4.0 and flow["selected_items"] == [{"name": "milk", "amount": 4.0}]
+    assert u.callback_query.answers == [(None, False)]  # acknowledged exactly once
+
+
 @pytest.mark.parametrize("bad", ["abc", "-5", "0", "nan", "inf", "1e12"])
 def test_amount_validation(store, bad):
     ctx = FakeContext()
@@ -145,7 +187,7 @@ def test_foreign_keyboard_and_lost_draft_are_refused(store):
     stale = text_update("old", NICCI).message
     u = cb_update(f"payer:{nicci_mid}", NICCI, stale)
     assert run(expense.expense_payer_cb(u, ctx)) == EXPENSE_PAYER
-    assert u.callback_query.answers[-1][1] is True  # alert shown
+    assert u.callback_query.answers == [("That keyboard belongs to someone else's draft.", True)]
 
     # another user with no draft in this chat
     other_ctx = FakeContext()

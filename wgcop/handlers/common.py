@@ -1,7 +1,9 @@
 """Menu navigation, /start, cancel/timeout, and the shared handler helpers."""
+import functools
 import logging
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import CallbackContext, ConversationHandler
 
 from wgcop.homes import (
@@ -26,6 +28,45 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ helpers
+class CallbackAck:
+    """Answer a callback query exactly once.
+
+    Telegram accepts a single answerCallbackQuery per tap; a second one fails
+    with "query is too old ... or query ID is invalid". A handler that
+    acknowledged the tap up front could therefore never show a refusal alert.
+    Handlers call ``ack(text, show_alert=True)`` for a refusal and leave the
+    plain acknowledgement to ``answers_callback``.
+    """
+
+    def __init__(self, query):
+        self._query = query
+        self.sent = False
+
+    async def __call__(self, text=None, show_alert=False) -> None:
+        if self.sent or self._query is None:
+            return
+        self.sent = True
+        await self._query.answer(text, show_alert=show_alert)
+
+
+def answers_callback(handler):
+    """Wrap ``handler(update, context, ack)`` so the query is answered exactly once:
+    with the alert the handler sent, or plainly after it returned."""
+
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: CallbackContext):
+        ack = CallbackAck(update.callback_query)
+        try:
+            return await handler(update, context, ack)
+        finally:
+            try:
+                await ack()
+            except TelegramError as exc:  # the user only sees the spinner a moment longer
+                logger.warning("Could not acknowledge callback query: %s", exc)
+
+    return wrapper
+
+
 async def continue_flow(update: Update, context: CallbackContext):
     """(home, flow) for the draft running in this chat, or (None, None) after
     telling the user the draft is gone (home switched, access lost, restart)."""

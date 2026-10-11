@@ -14,6 +14,7 @@ class TelegramDriver(BaseRequest):
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.answered = set()
         self.members = {}
         self.next_message = 1000
         self.next_update = 1
@@ -58,7 +59,15 @@ class TelegramDriver(BaseRequest):
                 markup = json.loads(markup) if isinstance(markup, str) else markup
                 if "inline_keyboard" in markup:
                     result["reply_markup"] = markup
-        elif endpoint in ("answerCallbackQuery", "deleteMessage"):
+        elif endpoint == "answerCallbackQuery":
+            query_id = str(params.get("callback_query_id"))
+            if query_id in self.answered:  # Telegram accepts exactly one answer per query
+                error = {"ok": False, "error_code": 400,
+                         "description": "Bad Request: query is too old and response timeout expired or query id is invalid"}
+                return 400, json.dumps(error).encode()
+            self.answered.add(query_id)
+            result = True
+        elif endpoint == "deleteMessage":
             result = True
         elif endpoint == "getChat":
             result = self.chat(int(params["chat_id"]))

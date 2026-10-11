@@ -5,6 +5,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import CallbackContext
 
+from wgcop.handlers.common import answers_callback
 from wgcop.homes import (
     CB_HOME_SELECT,
     HomeError,
@@ -132,9 +133,9 @@ async def _notify_admins(context, home, text, reply_markup=None) -> None:
             logger.info("Home %s: could not DM admin %s: %s", home["id"], uid, exc)
 
 
-async def join_cb(update: Update, context: CallbackContext) -> None:
+@answers_callback
+async def join_cb(update: Update, context: CallbackContext, ack) -> None:
     query = update.callback_query
-    await query.answer()
     caller = caller_from_update(update)
     if caller is None:
         return
@@ -153,7 +154,7 @@ async def join_cb(update: Update, context: CallbackContext) -> None:
             await query.edit_message_text("That request no longer exists.")
             return
         if not is_admin(home, caller.uid):
-            await query.answer("Only a home administrator can review requests.", show_alert=True)
+            await ack("Only a home administrator can review requests.", show_alert=True)
             return
         try:
             if approve:
@@ -179,7 +180,7 @@ async def join_cb(update: Update, context: CallbackContext) -> None:
     info = flow.get("join")
     tapped = getattr(query.message, "message_id", None)
     if not info or info.get("kb_msg") is None or tapped is None or info["kb_msg"] != tapped:
-        await query.answer("This join dialog is not yours. Send /join to start your own.", show_alert=True)
+        await ack("This join dialog is not yours. Send /join to start your own.", show_alert=True)
         return
     try:
         home = store.get_home(info["home_id"])
@@ -227,9 +228,9 @@ async def join_cb(update: Update, context: CallbackContext) -> None:
 
 
 # ----------------------------------------------------------- home picker
-async def home_select_cb(update: Update, context: CallbackContext) -> None:
+@answers_callback
+async def home_select_cb(update: Update, context: CallbackContext, ack) -> None:
     query = update.callback_query
-    await query.answer()
     caller = caller_from_update(update)
     if caller is None:
         return
@@ -241,7 +242,7 @@ async def home_select_cb(update: Update, context: CallbackContext) -> None:
             raise StoreError("no access")
         store.select_home(caller.uid, hid)
     except StoreError:
-        await query.answer("You do not have access to that home.", show_alert=True)
+        await ack("You do not have access to that home.", show_alert=True)
         return
     chat_id = update.effective_chat.id
     end_flow(context, chat_id)  # a draft from the previous home must not leak into this one

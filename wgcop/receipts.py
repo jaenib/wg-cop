@@ -46,9 +46,9 @@ def _adjust_items_to_total(items, receipt_total):
     return adjusted
 
 
-def build_receipt_items_text(items, selected):
+def build_receipt_items_text(items, selected, currency="CHF"):
     total = _receipt_shared_total(items, selected)
-    return f"Tap items to exclude personal ones.\n\nShared total: CHF {total:.2f}"
+    return f"Tap items to exclude personal ones.\n\nShared total: {currency} {total:.2f}"
 
 
 def build_receipt_items_kb(items, selected):

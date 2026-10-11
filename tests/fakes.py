@@ -7,6 +7,8 @@ import asyncio
 import itertools
 from types import SimpleNamespace
 
+from telegram.error import BadRequest
+
 _MESSAGE_IDS = itertools.count(1000)
 
 
@@ -112,6 +114,8 @@ class FakeCallbackQuery:
         self.markup_edits = []
 
     async def answer(self, text=None, show_alert=False, **kwargs):
+        if self.answers:  # Telegram accepts exactly one answer per callback query
+            raise BadRequest("Query is too old and response timeout expired or query id is invalid")
         self.answers.append((text, show_alert))
 
     async def edit_message_text(self, text, reply_markup=None, **kwargs):

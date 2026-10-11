@@ -16,7 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 from telegram.ext import CallbackContext, ConversationHandler
 
 from wgcop.formatting import format_currency, format_signed_currency
-from wgcop.handlers.common import cancel, continue_flow
+from wgcop.handlers.common import answers_callback, cancel, continue_flow
 from wgcop.homes import end_flow, home_currency, home_tz, owns_keyboard, require_home, start_flow
 from wgcop.keyboards import (
     BTN_CANCEL,
@@ -72,8 +72,8 @@ def _parse_amount(text: str):
     return amount
 
 
-async def _refuse_foreign_keyboard(query, state):
-    await query.answer("That keyboard belongs to someone else's draft.", show_alert=True)
+async def _refuse_foreign_keyboard(ack, state):
+    await ack("That keyboard belongs to someone else's draft.", show_alert=True)
     return state
 
 
@@ -251,20 +251,22 @@ async def expense_receipt_invalid(update: Update, context: CallbackContext) -> i
     return EXPENSE_RECEIPT
 
 
-async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
+@answers_callback
+async def receipt_items_cb(update: Update, context: CallbackContext, ack) -> int:
     query = update.callback_query
-    await query.answer()
     home, flow = await continue_flow(update, context)
     if home is None:
         return ConversationHandler.END
     if not owns_keyboard(query, flow):
-        return await _refuse_foreign_keyboard(query, EXPENSE_RECEIPT_REVIEW)
+        return await _refuse_foreign_keyboard(ack, EXPENSE_RECEIPT_REVIEW)
 
     items = flow.get("receipt_items", [])
     if not items:
         await query.edit_message_text("No items to review. Please send the receipt again.")
         return EXPENSE_RECEIPT
-    selected = set(flow.get("receipt_selected") or range(len(items)))
+    stored = flow.get("receipt_selected")
+    selected = set(range(len(items))) if stored is None else set(stored)  # [] = everything untoggled
+    currency = home_currency(home)
 
     if query.data == CB_RECEIPT_CANCEL:
         end_flow(context, update.effective_chat.id)
@@ -291,19 +293,23 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
         flow["receipt_selected"] = sorted(selected)
         flow["amount"] = _receipt_shared_total(items, selected)
         await query.edit_message_text(
-            build_receipt_items_text(items, selected), reply_markup=build_receipt_items_kb(items, selected)
+            build_receipt_items_text(items, selected, currency), reply_markup=build_receipt_items_kb(items, selected)
         )
         return EXPENSE_RECEIPT_REVIEW
 
     if query.data == CB_RECEIPT_DONE:
         if not selected:
-            await query.answer("Select at least one item.", show_alert=True)
+            await ack("Select at least one item.", show_alert=True)
+            return EXPENSE_RECEIPT_REVIEW
+        total = _receipt_shared_total(items, selected)
+        if not math.isfinite(total) or not 0 < total <= MAX_AMOUNT:
+            # Discount lines are kept on purpose, so a selection can add up to nothing.
+            await ack(f"The shared total must be more than zero (now {total:.2f}).", show_alert=True)
             return EXPENSE_RECEIPT_REVIEW
         chosen = [items[i] for i in sorted(selected)]
-        total = _receipt_shared_total(items, selected)
         flow["selected_items"] = chosen
         flow["amount"] = total
-        await query.edit_message_text(f"Shared total: {home_currency(home)} {total:.2f}")
+        await query.edit_message_text(f"Shared total: {currency} {total:.2f}")
         auto_desc = flow.get("receipt_description", "")
         if auto_desc:
             desc_kb = ReplyKeyboardMarkup([[auto_desc]], one_time_keyboard=True, resize_keyboard=True)
@@ -326,7 +332,7 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
             selected.symmetric_difference_update({idx})
             flow["receipt_selected"] = sorted(selected)
         await query.edit_message_text(
-            build_receipt_items_text(items, selected), reply_markup=build_receipt_items_kb(items, selected)
+            build_receipt_items_text(items, selected, currency), reply_markup=build_receipt_items_kb(items, selected)
         )
         return EXPENSE_RECEIPT_REVIEW
 
@@ -334,19 +340,19 @@ async def receipt_items_cb(update: Update, context: CallbackContext) -> int:
 
 
 # ------------------------------------------------------------ payer/split
-async def expense_payer_cb(update: Update, context: CallbackContext) -> int:
+@answers_callback
+async def expense_payer_cb(update: Update, context: CallbackContext, ack) -> int:
     query = update.callback_query
-    await query.answer()
     home, flow = await continue_flow(update, context)
     if home is None:
         return ConversationHandler.END
     if not owns_keyboard(query, flow):
-        return await _refuse_foreign_keyboard(query, EXPENSE_PAYER)
+        return await _refuse_foreign_keyboard(ack, EXPENSE_PAYER)
     if not query.data.startswith(CB_PAYER_PREFIX):
         return EXPENSE_PAYER
     member = member_by_mid(home, query.data[len(CB_PAYER_PREFIX):])
     if member is None:
-        await query.answer("That member no longer exists.", show_alert=True)
+        await ack("That member no longer exists.", show_alert=True)
         return EXPENSE_PAYER
     flow["payer_mid"] = member["mid"]
     flow["payer"] = member["name"]
@@ -357,14 +363,14 @@ async def expense_payer_cb(update: Update, context: CallbackContext) -> int:
     return EXPENSE_SPLIT
 
 
-async def expense_split_cb(update: Update, context: CallbackContext) -> int:
+@answers_callback
+async def expense_split_cb(update: Update, context: CallbackContext, ack) -> int:
     query = update.callback_query
-    await query.answer()
     home, flow = await continue_flow(update, context)
     if home is None:
         return ConversationHandler.END
     if not owns_keyboard(query, flow):
-        return await _refuse_foreign_keyboard(query, EXPENSE_SPLIT)
+        return await _refuse_foreign_keyboard(ack, EXPENSE_SPLIT)
     chat_id = update.effective_chat.id
     members = home["members"]
     selected = list(flow.get("split") or [])
@@ -402,12 +408,12 @@ async def expense_split_cb(update: Update, context: CallbackContext) -> int:
     if query.data == CB_SPLIT_DONE:
         names = [m["name"] for mid in selected for m in [member_by_mid(home, mid)] if m is not None]
         if not names:
-            await query.answer("Select at least one person.", show_alert=True)
+            await ack("Select at least one person.", show_alert=True)
             return EXPENSE_SPLIT
         amount = flow.get("amount")
         payer = flow.get("payer")
         desc = flow.get("description") or "(no description)"
-        if amount is None or payer is None:
+        if amount is None or payer is None or not math.isfinite(amount) or not 0 < amount <= MAX_AMOUNT:
             end_flow(context, chat_id)
             await query.edit_message_text("The draft is incomplete. Please start again.")
             await query.message.reply_text("Back to main menu.", reply_markup=get_main_keyboard())
