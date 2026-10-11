@@ -39,6 +39,14 @@ def _text(value, limit, what):
     return value
 
 
+def _label(value, limit, what):
+    """A short label that is interpolated into HTML-formatted messages unescaped."""
+    value = _text(value, limit, what)
+    if any(ch in value for ch in "<>&"):
+        raise Invalid(f"{what} must not contain <, > or &.")
+    return value
+
+
 def _int(value, lo, hi, what):
     try:
         number = int(str(value).strip())
@@ -60,7 +68,7 @@ def _timezone(value):
 # label -> (where, key, parser, hint)
 FIELDS = {
     BTN_SETTING_NAME: ("home", "name", lambda v: _text(v, 40, "The home name"), "e.g. 'WG Sonnenberg'"),
-    BTN_SETTING_CURRENCY: ("settings", "currency", lambda v: _text(v, 8, "The currency label"), "e.g. CHF, EUR or €"),
+    BTN_SETTING_CURRENCY: ("settings", "currency", lambda v: _label(v, 8, "The currency label"), "e.g. CHF, EUR or €"),
     BTN_SETTING_TIMEZONE: ("settings", "timezone", _timezone, "IANA name, e.g. Europe/Berlin"),
     BTN_SETTING_MINUTES: (
         "settings", "minutes_per_point", lambda v: _int(v, 1, 240, "Minutes per point"),
@@ -70,7 +78,7 @@ FIELDS = {
         "settings", "penalty_threshold_points", lambda v: _int(v, 1, 100, "The penalty threshold"),
         "points behind the leader before a penalty (default 4)",
     ),
-    BTN_SETTING_UNIT: ("settings", "penalty_unit", lambda v: _text(v, 20, "The penalty unit"), "e.g. beer, pizza, coffee"),
+    BTN_SETTING_UNIT: ("settings", "penalty_unit", lambda v: _label(v, 20, "The penalty unit"), "e.g. beer, pizza, coffee"),
 }
 
 

@@ -229,6 +229,11 @@ def test_remove_member_refuses_when_history_exists(store):
         remove_member(home, home["members"][0]["mid"])
     fresh = join_as_new_member(home, Caller(4242, "Temp"))
     assert not member_has_history(home, fresh)
+    home["chores"]["temp"] = 2  # legacy free-text key, different casing
+    assert member_has_history(home, fresh)
+    with pytest.raises(HomeError, match="Unlink"):
+        remove_member(home, fresh["mid"])
+    del home["chores"]["temp"]
     remove_member(home, fresh["mid"])
     assert member_for_uid(home, 4242) is None
 

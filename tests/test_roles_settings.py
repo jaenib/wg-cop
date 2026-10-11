@@ -159,6 +159,9 @@ def test_home_settings_menu_and_validation(store):
     run(settings.home_settings_menu(text_update("Penalty Unit", ADMIN), ctx))
     assert run(settings.home_settings_value(text_update("pizza", ADMIN), ctx)) == HOME_SETTINGS_MENU
     run(settings.home_settings_menu(text_update("Currency", ADMIN), ctx))
+    u = text_update("<3", ADMIN)  # would break every HTML-formatted amount
+    assert run(settings.home_settings_value(u, ctx)) == HOME_SETTINGS_VALUE
+    assert "must not contain" in u.message.last_reply
     assert run(settings.home_settings_value(text_update("EUR", ADMIN), ctx)) == HOME_SETTINGS_MENU
     run(settings.home_settings_menu(text_update("Home Name", ADMIN), ctx))
     assert run(settings.home_settings_value(text_update("  ", ADMIN), ctx)) == HOME_SETTINGS_VALUE

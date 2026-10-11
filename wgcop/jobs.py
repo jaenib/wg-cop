@@ -92,8 +92,11 @@ def _write_local_backup():
         logger.warning("Failed to write local backup: %s", exc)
         return
     try:
-        pattern = re.compile(r"^" + re.escape(base) + r"\.\d{8}-\d{6}\.bak$")
-        baks = sorted((f for f in os.listdir(BACKUP_DIR) if pattern.match(f)), reverse=True)
+        # The single-home job named its copies "<stem>.<stamp>.bak"; rotate those too.
+        stem = base[:-5] if base.endswith(".json") else base
+        pattern = re.compile(r"^(?:" + re.escape(base) + "|" + re.escape(stem) + r")\.(\d{8}-\d{6})\.bak$")
+        matches = {f: m.group(1) for f in os.listdir(BACKUP_DIR) if (m := pattern.match(f))}
+        baks = sorted(matches, key=matches.get, reverse=True)
         for old in baks[BACKUP_KEEP:]:
             os.remove(os.path.join(BACKUP_DIR, old))
     except Exception as exc:

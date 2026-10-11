@@ -168,7 +168,15 @@ def test_local_backup_rotates(store, tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "BACKUP_KEEP", 3)
     stamps = iter(f"20260922-{i:06d}" for i in range(10))
     monkeypatch.setattr(jobs.time, "strftime", lambda fmt: next(stamps))
+    backup_dir.mkdir()
+    base = store.path.name
+    stem = base[:-5] if base.endswith(".json") else base
+    legacy = backup_dir / f"{stem}.20200101-000000.bak"      # written by the single-home job
+    legacy.write_text("old")
+    archive = backup_dir / f"{base}.pre-multihome.bak"
+    archive.write_text("keep")
     for _ in range(5):
         jobs._write_local_backup()
-    files = sorted(os.listdir(backup_dir))
+    files = sorted(f for f in os.listdir(backup_dir) if f != archive.name)
     assert len(files) == 3 and files[-1].endswith("000004.bak")
+    assert not legacy.exists() and archive.read_text() == "keep"

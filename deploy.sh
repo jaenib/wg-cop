@@ -14,7 +14,8 @@
 # EMERGENCY FALLBACK (GitHub Actions broken):
 #   Use the parent deploy.sh, two directories above this file:
 #     ../../deploy.sh mario_robotta
-#   Review its rsync exclusions before use; multi-home state lives in data/.
+#   Review its rsync exclusions before use: the live store is wg_data_alpha.json
+#   in the bot dir (plus *.bak archives); it, .secrets/ and venv/ must stay excluded.
 #   Git remote alias for this repo on your Mac: jaenib-wgcop
 #
 # =============================================================================

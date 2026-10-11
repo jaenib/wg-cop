@@ -62,8 +62,6 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text(f"Names are limited to {MAX_NAME_LEN} characters.")
         return MANAGE_MEMBER
 
-    existing = member_by_name(home, text)
-
     def apply(h):
         current = member_by_name(h, text)
         if current is not None:
@@ -77,7 +75,6 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
     except HomeError as exc:
         await update.message.reply_text(str(exc))
         return MANAGE_MEMBER
-    del existing
     end_flow(context, update.effective_chat.id)
     await update.message.reply_text(response, reply_markup=get_main_keyboard())
     return ConversationHandler.END

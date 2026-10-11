@@ -96,6 +96,26 @@ def test_migration_keeps_every_record_and_balances(legacy_store, path):
     assert json.loads(path.read_text())["migrated_from_legacy"]["expenses"] == 4
 
 
+def test_second_migration_keeps_every_pre_migration_copy(path):
+    path.write_text(json.dumps(legacy_data()), encoding="utf-8")
+    assert Store(path).initialize(legacy_seed()) == "migrated"
+    archive = path.with_name(path.name + ".pre-multihome.bak")
+    first = archive.read_bytes()
+
+    # Rollback: the archive is restored, old code keeps writing, then new code starts again.
+    newer = legacy_data()
+    newer["expenses"][0]["description"] = "entered after the rollback"
+    path.write_text(json.dumps(newer), encoding="utf-8")
+    assert Store(path).initialize(legacy_seed()) == "migrated"
+
+    assert archive.read_bytes() == first                      # the first archive is untouched
+    extra = list(path.parent.glob(path.name + ".pre-multihome.bak.*"))
+    assert len(extra) == 1 and json.loads(extra[0].read_text()) == newer
+    assert extra[0].stat().st_mode & 0o077 == 0
+    migrated = Store(path).get_home(LEGACY_GROUP_ID)
+    assert migrated["expenses"][0]["description"] == "entered after the rollback"
+
+
 def test_migration_seeds_roles_and_links_members(legacy_store):
     home = legacy_store.get_home(LEGACY_GROUP_ID)
     assert home["roles"] == {"admins": [1001], "chronicler": None, "handler": 1001}

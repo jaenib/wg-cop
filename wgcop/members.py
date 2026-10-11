@@ -110,9 +110,7 @@ def _rename_member_in_data(data: dict, old_name: str, new_name: str) -> None:
     if old_norm in violators:
         violators[new_v_key] = violators.pop(old_norm)
 
-    for request in (data.get("join_requests") or {}).values():
-        pass  # requests reference members by mid, nothing to rename
-
+    # join_requests reference members by mid, nothing to rename there.
     for entry in data.get("chore_log") or []:
         if _normalise_member_name(entry.get("member", "")) == old_norm:
             entry["member"] = new_name

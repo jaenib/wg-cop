@@ -422,13 +422,17 @@ class Store:
             return "ok"
         env = migrate_legacy(old, seed, home_name=home_name)  # validated
         archive = self.path.with_name(self.path.name + LEGACY_ARCHIVE_SUFFIX)
-        if not archive.exists():
-            fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(self.path.read_bytes())
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.chmod(archive, 0o600)
+        if archive.exists():
+            # After a rollback (archive restored, old code kept writing) the legacy
+            # file is newer than the first archive: keep every pre-migration copy.
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            archive = self.path.with_name(f"{self.path.name}{LEGACY_ARCHIVE_SUFFIX}.{stamp}")
+        fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(self.path.read_bytes())
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(archive, 0o600)
         self._write(env)
         validate_envelope(self._load_raw())
         logger.info("Migrated legacy database to schema %s; original kept at %s", SCHEMA_VERSION, archive)

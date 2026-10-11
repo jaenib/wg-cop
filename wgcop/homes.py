@@ -346,8 +346,10 @@ def unclaimed_members(home) -> list[dict]:
 
 def member_has_history(home, member) -> bool:
     name = normalise_name(member)
-    if home["chores"].get(member["name"]) or home["penalties"].get(member["name"]):
-        return True
+    for table in (home["chores"], home["penalties"]):
+        # Legacy keys were free-text input, so compare them normalised like every other record.
+        if any(value and normalise_name(key) == name for key, value in table.items()):
+            return True
     for entry in home["chore_log"]:
         if normalise_name(entry.get("member")) == name:
             return True

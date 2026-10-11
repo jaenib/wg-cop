@@ -107,7 +107,8 @@ schema-version-2 envelope at the same `WG_COP_DATA_FILE` path (normally
 its chronicler, and the legacy per-member ids link the existing profiles.
 
 The original JSON is retained as `wg_data_alpha.json.pre-multihome.bak` (using
-your data filename when customized). Unknown or malformed state is refused; it
+your data filename when customized; a timestamped copy is written instead when
+that name is already taken). Unknown or malformed state is refused; it
 is never replaced with an empty database. Keep that archive and a private
 backup before upgrading. Older bot code cannot read the new envelope. Returning
 to old code requires a compatible exported household or recovery snapshot,
