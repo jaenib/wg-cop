@@ -19,7 +19,7 @@ def test_main_builds_expected_handlers_and_jobs(monkeypatch, tmp_path):
 
     handlers = app.handlers[0]
     conversations = [h for h in handlers if isinstance(h, ConversationHandler)]
-    assert len(handlers) == 45  # + /deletehome command and its confirmation callback
+    assert len(handlers) == 46  # + /deletehome command, its confirmation callback, stray-text fallback
     assert len(conversations) == 11
     assert all(c.conversation_timeout == 300 for c in conversations)
     # conversations are registered before every plain handler (see app.handoff)

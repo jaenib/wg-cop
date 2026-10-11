@@ -186,3 +186,23 @@ def test_revoked_admin_cannot_finish_pending_admin_flow(homes, entry, answer):
         await message(app, driver, -100, answer)
         assert homes.get_home(-100) == before
     asyncio.run(run_bot(scenario))
+
+
+def test_leftover_back_after_a_restart_returns_to_the_main_menu(homes):
+    async def scenario(app, driver):
+        await message(app, driver, 10, kb.BTN_MEMBER_MANAGEMENT)      # Alice, private chat
+        assert driver.messages(10)[-1].startswith("Current members")
+        # A restart forgets every conversation while the reply keyboard stays on screen.
+        for conv in [h for h in app.handlers[0] if hasattr(h, "_conversations")]:
+            conv._conversations.clear()
+        await message(app, driver, 10, "Back")
+        assert "Nothing is in progress" in driver.messages(10)[-1]
+        assert "flow:10" not in app.user_data[10]
+        # In a group, chat stays unanswered but a leftover Back is handled.
+        before = len(driver.messages(-100))
+        await message(app, driver, -100, "hello everyone")
+        assert len(driver.messages(-100)) == before
+        await message(app, driver, -100, "Back")
+        assert "Nothing is in progress" in driver.messages(-100)[-1]
+
+    asyncio.run(run_bot(scenario))
