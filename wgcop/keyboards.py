@@ -93,6 +93,9 @@ CB_JOIN_DENY_PREFIX = "join:deny:"
 SPLIT_CALLBACK_PATTERN = r"^(?:split_toggle:.*|split_all|split_done|split_back|split_cancel)$"
 RECEIPT_CALLBACK_PATTERN = r"^(?:receipt_toggle:.*|receipt_done|receipt_cancel|receipt_accept|receipt_manual)$"
 JOIN_CALLBACK_PATTERN = r"^join:(?:new|cancel|claim:.*|approve:.*|deny:.*)$"
+CB_HOME_DELETE_CONFIRM = "home:delete:confirm"
+CB_HOME_DELETE_CANCEL = "home:delete:cancel"
+HOME_DELETE_CALLBACK_PATTERN = r"^home:delete:(?:confirm|cancel)$"
 
 # Settings
 EXPENSE_LIST_LIMIT = 20
@@ -108,7 +111,7 @@ EXPENSE_LIST_LIMIT = 20
     EXPENSE_RECEIPT_REVIEW,
 ) = range(7)
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
-MANAGE_MEMBER, MANAGE_MEMBER_ACTION = range(2)
+MANAGE_MEMBER, MANAGE_MEMBER_ACTION, MANAGE_MEMBER_ADD = range(3)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
 ADMIN_PENALTY_MEMBER, ADMIN_PENALTY_COUNT = range(2)
@@ -299,6 +302,15 @@ def build_join_choice_kb(unclaimed_members, telegram_name: str):
         )
     rows.append([InlineKeyboardButton(BTN_CANCEL, callback_data=CB_JOIN_CANCEL)])
     return InlineKeyboardMarkup(rows)
+
+
+def build_delete_home_kb(home_name: str):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(_truncate_button_label(f"Yes, delete '{home_name}' permanently"), callback_data=CB_HOME_DELETE_CONFIRM)],
+            [InlineKeyboardButton(BTN_CANCEL, callback_data=CB_HOME_DELETE_CANCEL)],
+        ]
+    )
 
 
 def build_join_review_kb(uid: int):

@@ -2,6 +2,7 @@
 import json
 
 import pytest
+from telegram.error import TelegramError
 from telegram.ext import ConversationHandler
 
 from tests.fakes import (
@@ -35,10 +36,11 @@ from wgcop.keyboards import (
     EXPENSE_SPLIT,
     MANAGE_MEMBER,
     MANAGE_MEMBER_ACTION,
+    MANAGE_MEMBER_ADD,
     REDEEM_COUNT,
     REDEEM_MEMBER,
 )
-from wgcop.store import Store, member_by_name, member_for_uid, new_member
+from wgcop.store import Store, StoreError, member_by_name, member_for_uid, new_member
 
 END = ConversationHandler.END
 NICCI = FakeUser(1002, "Nicci", "Lopez")
@@ -293,8 +295,31 @@ def test_member_management_requires_admin_and_guards_history(store):
     assert u.message.last_reply == "Unauthorized."
 
     ctx = FakeContext()
-    assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
-    assert run(members.modify_members(text_update("Newbie", ADMIN), ctx)) == END
+    u = text_update("Member Management", ADMIN)
+    assert run(members.manage_members(u, ctx)) == MANAGE_MEMBER
+    labels = keyboard_labels(u.message.last_markup)
+    assert "Thomath Sucker" in labels and labels[-2:] == ["Add member", "Back"]
+
+    # a typo never creates a member
+    u = text_update("Tomath Sucker", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER
+    assert "Did you mean Thomath Sucker?" in u.message.last_reply
+    assert member_by_name(home_of(store), "Tomath Sucker") is None
+    u = text_update("Zorro", ADMIN)
+    assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER
+    assert "no member called 'Zorro'" in u.message.last_reply and "Did you mean" not in u.message.last_reply
+
+    # adding is explicit; a near-duplicate has to be confirmed
+    assert run(members.modify_members(text_update("Add member", ADMIN), ctx)) == MANAGE_MEMBER_ADD
+    u = text_update("Nicci Lopes", ADMIN)
+    assert run(members.member_add(u, ctx)) == MANAGE_MEMBER_ADD
+    assert "looks like Nicci Lopez" in u.message.last_reply
+    u = text_update("nicci lopez", ADMIN)                      # exact name: manage instead of adding
+    assert run(members.member_add(u, ctx)) == MANAGE_MEMBER_ACTION
+    assert any("already a member" in reply[0] for reply in u.message.replies)
+    assert run(members.member_action(text_update("Back", ADMIN), ctx)) == MANAGE_MEMBER
+    run(members.modify_members(text_update("Add member", ADMIN), ctx))
+    assert run(members.member_add(text_update("Newbie", ADMIN), ctx)) == END
     assert member_by_name(home_of(store), "Newbie") is not None
 
     assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
@@ -313,6 +338,13 @@ def test_member_management_requires_admin_and_guards_history(store):
     assert keyboard_labels(u.message.last_markup) == ["Retire Newbie", "Remove Newbie", "Back"]
     assert run(members.member_action(text_update("Remove Newbie", ADMIN), ctx)) == END
     assert member_by_name(home_of(store), "Newbie") is None
+
+    # sending the near-duplicate twice adds it after all
+    run(members.manage_members(text_update("Member Management", ADMIN), ctx))
+    run(members.modify_members(text_update("Add member", ADMIN), ctx))
+    assert run(members.member_add(text_update("Nicci Lopes", ADMIN), ctx)) == MANAGE_MEMBER_ADD
+    assert run(members.member_add(text_update("Nicci Lopes", ADMIN), ctx)) == END
+    assert member_by_name(home_of(store), "Nicci Lopes") is not None
 
 
 def test_retiring_a_member_freezes_their_books_and_sends_a_farewell(store):
@@ -351,14 +383,17 @@ def test_retiring_a_member_freezes_their_books_and_sends_a_farewell(store):
 
     # a member without a Telegram link gets no note; a retired member without history can be removed
     assert run(members.manage_members(text_update("Member Management", ADMIN), ctx)) == MANAGE_MEMBER
-    assert run(members.modify_members(text_update("Newbie", ADMIN), ctx)) == END
+    assert run(members.modify_members(text_update("Add member", ADMIN), ctx)) == MANAGE_MEMBER_ADD
+    assert run(members.member_add(text_update("Newbie", ADMIN), ctx)) == END
     run(members.manage_members(text_update("Member Management", ADMIN), ctx))
     run(members.modify_members(text_update("Newbie", ADMIN), ctx))
     u = text_update("Retire Newbie", ADMIN)
     assert run(members.member_action(u, ctx)) == END
     assert "no linked Telegram account" in u.message.last_reply
-    run(members.manage_members(text_update("Member Management", ADMIN), ctx))
-    u = text_update("Newbie", ADMIN)
+    u = text_update("Member Management", ADMIN)
+    run(members.manage_members(u, ctx))
+    assert "Newbie (retired)" in keyboard_labels(u.message.last_markup)
+    u = text_update("Newbie (retired)", ADMIN)                 # the tapped button label
     assert run(members.modify_members(u, ctx)) == MANAGE_MEMBER_ACTION
     assert keyboard_labels(u.message.last_markup) == ["Remove Newbie", "Back"]
     assert "retired on" in u.message.last_reply
@@ -483,6 +518,63 @@ def test_newhome_requires_group_admin_and_join_links_users(store):
     assert member_for_uid(store.get_home(-200), 99)["name"] == "Old Timer"
     assert store.get_home(-200)["join_requests"] == {}
     assert any(s[0] == 99 and "approved" in s[1] for s in bot.sent)
+
+
+def test_deletehome_needs_admin_confirmation_and_hands_over_an_archive(store):
+    beach = FakeChat(-200, "supergroup", title="Beach House")
+    zoe, sam = FakeUser(77, "Zoe"), FakeUser(88, "Sam")
+    store.create_home(-200, "Beach", 77, "Zoe")
+    store.update(-200, lambda h: h["members"].append(new_member(h, "Sam", uid=88)))
+    store.select_home(88, -200)
+    bot = FakeBot()
+    ctx = FakeContext(bot=bot)
+
+    u = text_update("/deletehome", zoe)                       # private chat: refused
+    run(home_h.delete_home(u, ctx))
+    assert "inside the Telegram group" in u.message.last_reply
+    u = text_update("/deletehome", sam, beach)                # member, not admin
+    run(home_h.delete_home(u, FakeContext(bot=bot)))
+    assert "Only an administrator" in u.message.last_reply
+
+    u = text_update("/deletehome", zoe, beach)
+    run(home_h.delete_home(u, ctx))
+    kb = u.message.sent_messages[-1]
+    assert keyboard_labels(u.message.last_markup) == ["Yes, delete 'Beach' permanently", "Cancel"]
+    assert "2 member(s)" in u.message.last_reply
+    foreign = cb_update("home:delete:confirm", sam, kb)       # somebody else's tap
+    run(home_h.delete_home_cb(foreign, FakeContext(bot=bot)))
+    assert foreign.callback_query.answers[-1][1] is True and store.get_home(-200)["name"] == "Beach"
+    u2 = cb_update("home:delete:cancel", zoe, kb)
+    run(home_h.delete_home_cb(u2, ctx))
+    assert "Kept 'Beach'" in u2.callback_query.edits[-1][0]
+    u3 = cb_update("home:delete:confirm", zoe, kb)            # the old keyboard is dead now
+    run(home_h.delete_home_cb(u3, ctx))
+    assert u3.callback_query.answers[-1][1] is True and store.get_home(-200)["name"] == "Beach"
+
+    # confirmed: archive to the admin first, then the home and its selections are gone
+    u = text_update("/deletehome", zoe, beach)
+    run(home_h.delete_home(u, ctx))
+    u = cb_update("home:delete:confirm", zoe, u.message.sent_messages[-1])
+    run(home_h.delete_home_cb(u, ctx))
+    chat_id, filename, caption, payload = bot.documents[-1]
+    assert chat_id == 77 and filename.startswith("wg_Beach_") and "before its deletion" in caption
+    assert json.loads(payload)["home"]["name"] == "Beach"
+    with pytest.raises(StoreError):
+        store.get_home(-200)
+    assert store.selected_home(88) is None
+    assert "Home 'Beach' deleted" in u.callback_query.edits[-1][0]
+    assert home_of(store)["name"] == "WG"                     # the other home is untouched
+
+    # no archive, no deletion
+    loft = FakeChat(-300, "supergroup", title="Loft")
+    store.create_home(-300, "Loft", 77, "Zoe")
+    bot.fail_document = TelegramError("Forbidden: bot can't initiate conversation with a user")
+    u = text_update("/deletehome", zoe, loft)
+    run(home_h.delete_home(u, ctx))
+    u = cb_update("home:delete:confirm", zoe, u.message.sent_messages[-1])
+    run(home_h.delete_home_cb(u, ctx))
+    assert "nothing was deleted" in u.callback_query.edits[-1][0]
+    assert store.get_home(-300)["name"] == "Loft"
 
 
 def test_join_in_dm_uses_group_membership(store):

@@ -1,4 +1,5 @@
 """Member management (admin: add, retire, remove), own profile, username change and vacation status."""
+import difflib
 import logging
 
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
@@ -21,6 +22,7 @@ from wgcop.keyboards import (
     CHANGE_USERNAME_NEW,
     MANAGE_MEMBER,
     MANAGE_MEMBER_ACTION,
+    MANAGE_MEMBER_ADD,
     get_cancel_keyboard,
     get_main_keyboard,
     get_manage_self_keyboard,
@@ -32,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 MAX_NAME_LEN = 40
 BTN_MEMBERS_BACK = "Back"
+BTN_MEMBERS_ADD = "Add member"
+RETIRED_SUFFIX = " (retired)"
+CLOSE_MATCH = 0.8  # difflib ratio from which a typed name counts as "probably this member"
 
 
 def _member_summary(home) -> str:
@@ -76,18 +81,39 @@ def farewell_text(home, member, stats) -> str:
 
 
 # ------------------------------------------------------------ admin: members
+def _member_label(member) -> str:
+    return member["name"] + (RETIRED_SUFFIX if member.get("status") == "retired" else "")
+
+
+def _member_from_label(home, text):
+    """The member a tapped or typed label names (exact, case-insensitive; the '(retired)' suffix is optional)."""
+    if text.casefold().endswith(RETIRED_SUFFIX):
+        text = text[: -len(RETIRED_SUFFIX)]
+    return member_by_name(home, text.strip())
+
+
+def _closest_member(home, text):
+    """An existing member whose name a typed name probably meant (typo guard), or None."""
+    by_fold = {m["name"].casefold(): m for m in home["members"]}
+    hits = difflib.get_close_matches(text.casefold(), list(by_fold), n=1, cutoff=CLOSE_MATCH)
+    return by_fold[hits[0]] if hits else None
+
+
+def _members_keyboard(home):
+    rows = [[KeyboardButton(_member_label(m))] for m in home["members"]]
+    rows.append([KeyboardButton(BTN_MEMBERS_ADD), KeyboardButton(BTN_MEMBERS_BACK)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
 async def _show_member_list(message, home) -> int:
     if home["members"]:
         txt = (
             f"Current members: {_member_summary(home)}\n\n"
-            "Send a new name to add a member, or an existing name to manage that member (retire or remove).\n"
-            "Or type 'Back' to return."
+            f"Tap a member to manage them (retire or remove), or '{BTN_MEMBERS_ADD}' to add someone new."
         )
     else:
-        txt = "No members yet. Send a name to add. Or type 'Back' to return."
-    await message.reply_text(
-        txt, reply_markup=ReplyKeyboardMarkup([[KeyboardButton(BTN_MEMBERS_BACK)]], resize_keyboard=True)
-    )
+        txt = f"No members yet. Tap '{BTN_MEMBERS_ADD}' to add someone."
+    await message.reply_text(txt, reply_markup=_members_keyboard(home))
     return MANAGE_MEMBER
 
 
@@ -100,7 +126,7 @@ async def manage_members(update: Update, context: CallbackContext) -> int:
 
 
 async def modify_members(update: Update, context: CallbackContext) -> int:
-    """A new name adds a member; an existing name opens that member's actions."""
+    """A tapped (or exactly typed) member name opens their actions; adding is its own step."""
     home, flow = await continue_admin_flow(update, context)
     if home is None:
         return ConversationHandler.END
@@ -109,17 +135,26 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
         end_flow(context, update.effective_chat.id)
         await update.message.reply_text("Member management closed.", reply_markup=get_main_keyboard())
         return ConversationHandler.END
-    if len(text) > MAX_NAME_LEN:
-        await update.message.reply_text(f"Names are limited to {MAX_NAME_LEN} characters.")
-        return MANAGE_MEMBER
-
-    member = member_by_name(home, text)
+    if text.casefold() == BTN_MEMBERS_ADD.casefold():
+        flow.pop("add_confirm", None)
+        await update.message.reply_text(
+            "Send the new member's name:",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(BTN_MEMBERS_BACK)]], resize_keyboard=True),
+        )
+        return MANAGE_MEMBER_ADD
+    member = _member_from_label(home, text)
     if member is None:
-        get_store().update(home["id"], lambda h: h["members"].append(new_member(h, text)))
-        end_flow(context, update.effective_chat.id)
-        await update.message.reply_text(f"Added {text} to the household.", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
+        close = _closest_member(home, text)
+        hint = f"Did you mean {close['name']}? Tap their name below." if close else "Tap a name below to manage a member."
+        await update.message.reply_text(
+            f"There is no member called '{text}'. {hint} To add someone new, tap '{BTN_MEMBERS_ADD}'.",
+            reply_markup=_members_keyboard(home),
+        )
+        return MANAGE_MEMBER
+    return await _show_member_actions(update, flow, home, member)
 
+
+async def _show_member_actions(update: Update, flow, home, member) -> int:
     flow["manage_mid"] = member["mid"]
     name = member["name"]
     retired = member.get("status") == "retired"
@@ -144,6 +179,38 @@ async def modify_members(update: Update, context: CallbackContext) -> int:
         intro + "\n\n" + "\n".join(hints), reply_markup=ReplyKeyboardMarkup(rows, resize_keyboard=True)
     )
     return MANAGE_MEMBER_ACTION
+
+
+async def member_add(update: Update, context: CallbackContext) -> int:
+    """Add a member by name; a name that looks like an existing member has to be sent twice."""
+    home, flow = await continue_admin_flow(update, context)
+    if home is None:
+        return ConversationHandler.END
+    text = " ".join(update.message.text.split())
+    if text.lower() in {"back", "cancel"}:
+        flow.pop("add_confirm", None)
+        return await _show_member_list(update.message, home)
+    if not text or len(text) > MAX_NAME_LEN:
+        await update.message.reply_text(f"Please send a name of 1\u2013{MAX_NAME_LEN} characters.")
+        return MANAGE_MEMBER_ADD
+    existing = member_by_name(home, text)
+    if existing is not None:
+        flow.pop("add_confirm", None)
+        await update.message.reply_text(f"{existing['name']} is already a member.")
+        return await _show_member_actions(update, flow, home, existing)
+    close = _closest_member(home, text)
+    if close is not None and flow.get("add_confirm") != text.casefold():
+        flow["add_confirm"] = text.casefold()
+        await update.message.reply_text(
+            f"That looks like {close['name']}, who is already a member. "
+            f"Send '{text}' again to add a new member with that name anyway, or '{BTN_MEMBERS_BACK}'."
+        )
+        return MANAGE_MEMBER_ADD
+    flow.pop("add_confirm", None)
+    get_store().update(home["id"], lambda h: h["members"].append(new_member(h, text)))
+    end_flow(context, update.effective_chat.id)
+    await update.message.reply_text(f"Added {text} to the household.", reply_markup=get_main_keyboard())
+    return ConversationHandler.END
 
 
 async def member_action(update: Update, context: CallbackContext) -> int:

@@ -1,7 +1,7 @@
-"""Homes: /newhome, /join (with admin-approved claims), home selection, group migration."""
+"""Homes: /newhome, /deletehome, /join (with admin-approved claims), home selection, group migration."""
 import logging
 
-from telegram import Update
+from telegram import ReplyKeyboardRemove, Update
 from telegram.error import TelegramError
 from telegram.ext import CallbackContext
 
@@ -22,12 +22,15 @@ from wgcop.homes import (
     request_claim,
     unclaimed_members,
 )
+from wgcop.jobs import _send_home_export
 from wgcop.keyboards import (
+    CB_HOME_DELETE_CANCEL,
     CB_JOIN_APPROVE_PREFIX,
     CB_JOIN_CANCEL,
     CB_JOIN_CLAIM_PREFIX,
     CB_JOIN_DENY_PREFIX,
     CB_JOIN_NEW,
+    build_delete_home_kb,
     build_join_choice_kb,
     build_join_review_kb,
     get_main_keyboard,
@@ -69,6 +72,92 @@ async def newhome(update: Update, context: CallbackContext) -> None:
         f"('{home['members'][0]['name']}'). Everyone else: send /join here.",
         reply_markup=get_main_keyboard(),
     )
+
+
+# ------------------------------------------------------------- /deletehome
+def _home_size(home) -> str:
+    return (
+        f"{len(home.get('members') or [])} member(s), {len(home.get('expenses') or [])} expense(s), "
+        f"{len(home.get('chore_log') or [])} chore entries"
+    )
+
+
+async def delete_home(update: Update, context: CallbackContext) -> None:
+    """Home admin, inside the home's group: confirm by button; the archive goes to them by DM first."""
+    chat = update.effective_chat
+    caller = caller_from_update(update)
+    if caller is None:
+        await update.message.reply_text("I need a personal Telegram account for that.")
+        return
+    if not is_group_chat(chat):
+        await update.message.reply_text("Run /deletehome inside the Telegram group of the home you want to delete.")
+        return
+    home = get_store().home_for_group(chat.id)
+    if home is None:
+        await update.message.reply_text("This group has no home.")
+        return
+    if not is_admin(home, caller.uid):
+        await update.message.reply_text("Only an administrator of this home can delete it.")
+        return
+    sent = await update.message.reply_text(
+        f"Delete the home '{home['name']}' ({_home_size(home)})?\n\n"
+        "This removes the home with all its bookkeeping, roles and settings from the bot; it cannot be undone. "
+        "Before deleting I will send you a JSON archive of the home by private message.",
+        reply_markup=build_delete_home_kb(home["name"]),
+    )
+    flow_state(context, chat.id)["delete_home"] = {
+        "home_id": home["id"],
+        "kb_msg": getattr(sent, "message_id", None),
+    }
+
+
+@answers_callback
+async def delete_home_cb(update: Update, context: CallbackContext, ack) -> None:
+    query = update.callback_query
+    caller = caller_from_update(update)
+    if caller is None:
+        return
+    chat_id = update.effective_chat.id
+    flow = flow_state(context, chat_id)
+    info = flow.get("delete_home")
+    tapped = getattr(query.message, "message_id", None)
+    if not info or info.get("kb_msg") is None or tapped is None or info["kb_msg"] != tapped:
+        await ack("This confirmation is not yours or has expired. Send /deletehome to start again.", show_alert=True)
+        return
+    flow.pop("delete_home", None)  # one tap per confirmation, whichever button
+    store = get_store()
+    try:
+        home = store.get_home(info["home_id"])
+    except StoreError:
+        await query.edit_message_text("That home no longer exists.")
+        return
+    if query.data == CB_HOME_DELETE_CANCEL:
+        await query.edit_message_text(f"Kept '{home['name']}'. Nothing was deleted.")
+        return
+    if not is_admin(home, caller.uid):
+        await ack("Only an administrator of this home can delete it.", show_alert=True)
+        return
+    try:
+        await _send_home_export(context, home, caller.uid, f"Archive of '{home['name']}' before its deletion")
+    except TelegramError as exc:
+        logger.info("Home %s: archive DM to %s failed: %s", home["id"], caller.uid, exc)
+        await query.edit_message_text(
+            "I could not send you the archive by private message, so nothing was deleted. "
+            "Open a private chat with me, press Start, then send /deletehome here again."
+        )
+        return
+    try:
+        store.delete_home(home["id"])
+    except StoreError as exc:
+        await query.edit_message_text(f"Could not delete the home: {exc}")
+        return
+    end_flow(context, chat_id)
+    logger.info("Home %s ('%s') deleted by %s", home["id"], home["name"], caller.uid)
+    await query.edit_message_text(
+        f"Home '{home['name']}' deleted ({_home_size(home)}). Its bookkeeping, roles and settings are gone from the bot; "
+        "the archive is in your private chat. This group can start over with /newhome."
+    )
+    await query.message.reply_text("Goodbye from this group.", reply_markup=ReplyKeyboardRemove())
 
 
 # ------------------------------------------------------------------- /join

@@ -66,11 +66,21 @@ from wgcop.handlers.expense import (
     receipt_items_cb,
     start_expense,
 )
-from wgcop.handlers.home import home_select_cb, join, join_cb, newhome, on_migrate, switch_home
+from wgcop.handlers.home import (
+    delete_home,
+    delete_home_cb,
+    home_select_cb,
+    join,
+    join_cb,
+    newhome,
+    on_migrate,
+    switch_home,
+)
 from wgcop.handlers.members import (
     do_change_username,
     manage_members,
     member_action,
+    member_add,
     modify_members,
     open_manage_self,
     set_vacation_status,
@@ -133,10 +143,12 @@ from wgcop.keyboards import (
     EXPENSE_RECEIPT_REVIEW,
     EXPENSE_SPLIT,
     HOME_SETTINGS_MENU,
+    HOME_DELETE_CALLBACK_PATTERN,
     HOME_SETTINGS_VALUE,
     JOIN_CALLBACK_PATTERN,
     MANAGE_MEMBER,
     MANAGE_MEMBER_ACTION,
+    MANAGE_MEMBER_ADD,
     RECEIPT_CALLBACK_PATTERN,
     REDEEM_COUNT,
     REDEEM_MEMBER,
@@ -251,6 +263,7 @@ def register_handlers(app: Application) -> None:
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("newhome", newhome))
+    app.add_handler(CommandHandler("deletehome", delete_home))
     app.add_handler(CommandHandler("join", join))
     app.add_handler(CommandHandler("expenses", list_expenses))
     app.add_handler(CommandHandler("chore", handle_chore))
@@ -280,6 +293,7 @@ def register_handlers(app: Application) -> None:
     # Inline callbacks outside conversations
     app.add_handler(CallbackQueryHandler(home_select_cb, pattern=f"^{re.escape(CB_HOME_SELECT)}"))
     app.add_handler(CallbackQueryHandler(join_cb, pattern=JOIN_CALLBACK_PATTERN))
+    app.add_handler(CallbackQueryHandler(delete_home_cb, pattern=HOME_DELETE_CALLBACK_PATTERN))
 
     # Stale inline keyboards (after a restart or a finished draft)
     async def _stale_cb(update: Update, context: CallbackContext) -> None:
@@ -348,6 +362,7 @@ def _register_conversations(app: Application) -> None:
         "__entry__": manage_members,
         MANAGE_MEMBER: _text_steps(modify_members, cancel_first=False),
         MANAGE_MEMBER_ACTION: _text_steps(member_action, cancel_first=False),
+        MANAGE_MEMBER_ADD: _text_steps(member_add, cancel_first=False),
     }))
 
     app.add_handler(_conversation(BTN_CHANGE_USERNAME, {

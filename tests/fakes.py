@@ -25,6 +25,7 @@ class FakeBot:
         self.chat_members = chat_members or {}  # (chat_id, uid) -> status
         self.chats = chats or {}                # chat_id -> title
         self.fail_send = None   # exception to raise from send_message
+        self.fail_document = None  # exception to raise from send_document
 
     async def send_message(self, chat_id, text, **kwargs):
         if self.fail_send is not None:
@@ -33,6 +34,8 @@ class FakeBot:
         return FakeMessage(text=text, chat=FakeChat(chat_id))
 
     async def send_document(self, chat_id, document, filename=None, caption=None, **kwargs):
+        if self.fail_document is not None:
+            raise self.fail_document
         payload = document.read() if hasattr(document, "read") else document
         self.documents.append((chat_id, filename, caption, payload))
 
