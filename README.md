@@ -35,6 +35,10 @@ A home is bound to its Telegram group; the group's chat id is the home's id.
 - **Create a home**: add the bot to the group and send `/newhome <name>` there.
   Only a Telegram group administrator or creator can do this; they become the
   home's first administrator and member.
+- **Delete a home**: a home administrator sends `/deletehome` in the group and
+  confirms with the button. The bot first sends them a JSON archive of the home
+  by private message, then removes the home with all its bookkeeping, roles and
+  settings. The group can start over with `/newhome`.
 - **Join**: send `/join` in the group. Choose "I'm new" to be added under your
   Telegram name, or "I am <profile>" to claim an existing unlinked profile.
   Claims need approval by a home administrator, who receives a DM with
