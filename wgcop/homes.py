@@ -272,6 +272,8 @@ def link_member(home, mid, uid) -> dict:
     member = member_by_mid(home, mid)
     if member is None:
         raise HomeError("That member does not exist.")
+    if member.get("status") == "retired":
+        raise HomeError(f"{member['name']} has retired from this home.")
     if member.get("uid") not in (None, uid):
         raise HomeError(f"{member['name']} is already linked to another Telegram account.")
     other = member_for_uid(home, uid)
@@ -317,6 +319,8 @@ def request_claim(home, caller: Caller, mid: str) -> dict:
     member = member_by_mid(home, mid)
     if member is None:
         raise HomeError("That member does not exist.")
+    if member.get("status") == "retired":
+        raise HomeError(f"{member['name']} has retired from this home.")
     if member.get("uid"):
         raise HomeError(f"{member['name']} is already linked to a Telegram account.")
     home["join_requests"][str(caller.uid)] = {
@@ -341,7 +345,7 @@ def deny_claim(home, uid) -> None:
 
 
 def unclaimed_members(home) -> list[dict]:
-    return [m for m in home["members"] if not m.get("uid")]
+    return [m for m in home["members"] if not m.get("uid") and m.get("status") != "retired"]
 
 
 def member_has_history(home, member) -> bool:
@@ -368,11 +372,39 @@ def remove_member(home, mid) -> dict:
         raise HomeError("That member does not exist.")
     if member_has_history(home, member):
         raise HomeError(
-            f"{member['name']} appears in expenses, chores or penalties. "
-            "Unlink or set vacating instead of removing, so the books stay consistent."
+            f"{member['name']} appears in expenses, chores or penalties, so the books need the record. "
+            "Retire them instead: their numbers stay frozen and they leave every menu and report."
         )
     home["members"].remove(member)
     return member
+
+
+def retire_member(home, mid) -> tuple[dict, int | None]:
+    """Freeze a member who moved out: records stay, but no entries, menus, reports, roles or Telegram link.
+
+    Returns (member, former_uid) so the caller can send a farewell note."""
+    member = member_by_mid(home, mid)
+    if member is None:
+        raise HomeError("That member does not exist.")
+    if member.get("status") == "retired":
+        raise HomeError(f"{member['name']} is already retired.")
+    uid = member.get("uid")
+    roles = home["roles"]
+    if uid is not None:
+        if uid in roles["admins"]:
+            if len(roles["admins"]) == 1:
+                raise HomeError(f"{member['name']} is the only administrator. Add another administrator first.")
+            roles["admins"].remove(uid)
+        for role in ("chronicler", "handler"):
+            if roles.get(role) == uid:
+                roles[role] = None
+        home["join_requests"].pop(str(uid), None)
+        member["retired_uid"] = uid
+    home["last_week_violators"].pop(normalise_name(member), None)
+    member.pop("uid", None)
+    member["status"] = "retired"
+    member["retired_at"] = _now_iso()
+    return member, uid
 
 
 # ----------------------------------------------------------------- settings

@@ -45,6 +45,7 @@ DEFAULT_SETTINGS = {
 }
 
 SINGLE_ROLES = ("chronicler", "handler")
+MEMBER_STATUSES = ("active", "vacating", "retired")
 LEGACY_REQUIRED_KEYS = ("members", "expenses", "chores", "penalties")
 HOME_LIST_KEYS = ("members", "expenses", "chore_log")
 HOME_DICT_KEYS = ("chores", "penalties", "last_week_violators", "join_requests",
@@ -242,8 +243,13 @@ def validate_home(home, key=None) -> None:
             if uid in seen_uids:
                 raise StoreError(f"Home {hid!r}: user {uid} is linked to two members")
             seen_uids.add(uid)
-        if member.get("status") not in ("active", "vacating"):
+        if member.get("status") not in MEMBER_STATUSES:
             raise StoreError(f"Home {hid!r}: member {member['name']!r} has an unknown status")
+        if member.get("status") == "retired" and uid is not None:
+            raise StoreError(f"Home {hid!r}: retired member {member['name']!r} must not stay linked")
+        retired_uid = member.get("retired_uid")
+        if retired_uid is not None and not is_user_id(retired_uid):
+            raise StoreError(f"Home {hid!r}: member {member['name']!r} has an invalid retired_uid")
     settings = home["settings"]
     if not valid_time(settings.get("weekly_report_time", "09:30")):
         raise StoreError(f"Home {hid!r}: weekly_report_time must be HH:MM")
@@ -335,7 +341,7 @@ def migrate_legacy(old: dict, seed: dict | None = None, home_name: str = "WG") -
                 member["uid"] = uid
         else:
             raise StoreError(f"Legacy member record not understood: {raw!r}")
-        if member["status"] not in ("active", "vacating"):
+        if member["status"] not in MEMBER_STATUSES:
             member["status"] = "active"
         members.append(member)
     home["members"] = members

@@ -90,3 +90,13 @@ def test_due_logic_around_monday():
     assert not _weekly_report_is_due(data, reference=tuesday)
     data["weekly_report_meta"]["last_sent"] = BERLIN.localize(datetime(2026, 9, 14, 9, 31)).isoformat()
     assert _weekly_report_is_due(data, reference=tuesday)
+
+
+def test_retired_members_are_left_out_of_standings_and_penalties():
+    data = _data({"Alice": 10, "Bob": 2, "Zed": 30}, penalties={"Zed": 3})
+    data["members"][2]["status"] = "retired"
+    text = _build_weekly_report(data)
+    assert "Leader: Alice with 10 points" in text
+    assert "Zed" not in text
+    assert data["last_week_violators"] == {"bob": True}
+    assert data["penalties"] == {"Zed": 3}   # frozen, untouched

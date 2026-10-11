@@ -12,7 +12,7 @@ from wgcop.keyboards import (
     get_main_keyboard,
     get_member_keyboard,
 )
-from wgcop.members import _match_member_name, add_chore_entry
+from wgcop.members import _match_member_name, active_members, add_chore_entry
 from wgcop.store import get_store, member_for_uid
 
 MAX_MINUTES = 24 * 60
@@ -45,7 +45,7 @@ async def chore_user(update: Update, context: CallbackContext) -> int:
     choice = update.message.text.strip()
     if choice.lower() in CANCEL_WORDS:
         return await cancel(update, context)
-    member = _match_member_name(home["members"], choice)
+    member = _match_member_name(active_members(home), choice)
     if member is None:
         await update.message.reply_text("Please pick a member from the keyboard.")
         return CHORE_USER

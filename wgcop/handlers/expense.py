@@ -46,7 +46,7 @@ from wgcop.keyboards import (
     get_expense_mode_keyboard,
     get_main_keyboard,
 )
-from wgcop.members import calculate_balances
+from wgcop.members import _is_retired, active_members, calculate_balances
 from wgcop.receipts import (
     ReceiptParsingError,
     _adjust_items_to_total,
@@ -82,7 +82,7 @@ async def start_expense(update: Update, context: CallbackContext) -> int:
     home = await require_home(update, context)
     if home is None:
         return ConversationHandler.END
-    if not home.get("members"):
+    if not active_members(home):
         await update.message.reply_text("No members found. Please add members first.", reply_markup=get_main_keyboard())
         return ConversationHandler.END
     flow = start_flow(context, update.effective_chat.id, home)
@@ -150,7 +150,7 @@ async def expense_amount(update: Update, context: CallbackContext) -> int:
 
 async def _prompt_for_payer(message, home, flow) -> int:
     await message.reply_text("Who paid?", reply_markup=ReplyKeyboardRemove())
-    sent = await message.reply_html("<b>Select payer:</b>", reply_markup=build_payer_inline_kb(home["members"]))
+    sent = await message.reply_html("<b>Select payer:</b>", reply_markup=build_payer_inline_kb(active_members(home)))
     flow["kb_msg"] = getattr(sent, "message_id", None)
     return EXPENSE_PAYER
 
@@ -351,14 +351,14 @@ async def expense_payer_cb(update: Update, context: CallbackContext, ack) -> int
     if not query.data.startswith(CB_PAYER_PREFIX):
         return EXPENSE_PAYER
     member = member_by_mid(home, query.data[len(CB_PAYER_PREFIX):])
-    if member is None:
+    if member is None or _is_retired(member):
         await ack("That member no longer exists.", show_alert=True)
         return EXPENSE_PAYER
     flow["payer_mid"] = member["mid"]
     flow["payer"] = member["name"]
     flow["split"] = []
     await query.edit_message_text("Select who shares the expense (toggle). Then press Done.")
-    sent = await query.message.reply_text("Split with:", reply_markup=build_split_inline_kb(home["members"], []))
+    sent = await query.message.reply_text("Split with:", reply_markup=build_split_inline_kb(active_members(home), []))
     flow["kb_msg"] = getattr(sent, "message_id", None)
     return EXPENSE_SPLIT
 
@@ -372,7 +372,7 @@ async def expense_split_cb(update: Update, context: CallbackContext, ack) -> int
     if not owns_keyboard(query, flow):
         return await _refuse_foreign_keyboard(ack, EXPENSE_SPLIT)
     chat_id = update.effective_chat.id
-    members = home["members"]
+    members = active_members(home)
     selected = list(flow.get("split") or [])
 
     if query.data == CB_SPLIT_BACK:
@@ -396,7 +396,8 @@ async def expense_split_cb(update: Update, context: CallbackContext, ack) -> int
 
     if query.data.startswith(CB_SPLIT_TOGGLE_PREFIX):
         mid = query.data[len(CB_SPLIT_TOGGLE_PREFIX):]
-        if member_by_mid(home, mid) is not None:
+        member = member_by_mid(home, mid)
+        if member is not None and not _is_retired(member):
             if mid in selected:
                 selected.remove(mid)
             else:
@@ -406,7 +407,7 @@ async def expense_split_cb(update: Update, context: CallbackContext, ack) -> int
         return EXPENSE_SPLIT
 
     if query.data == CB_SPLIT_DONE:
-        names = [m["name"] for mid in selected for m in [member_by_mid(home, mid)] if m is not None]
+        names = [m["name"] for mid in selected for m in [member_by_mid(home, mid)] if m is not None and not _is_retired(m)]
         if not names:
             await ack("Select at least one person.", show_alert=True)
             return EXPENSE_SPLIT

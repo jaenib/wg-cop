@@ -276,3 +276,18 @@ def test_get_store_singleton_can_be_replaced(path):
         assert store_mod.get_store() is s
     finally:
         store_mod.set_store(None)
+
+
+def test_retired_member_validates_only_when_unlinked(legacy_store):
+    def retire(h):
+        member = h["members"][0]
+        member["retired_uid"] = member.pop("uid", None)
+        member["status"] = "retired"
+        member["retired_at"] = "2026-10-11T02:00:00+00:00"
+
+    legacy_store.update(LEGACY_GROUP_ID, retire)
+    assert legacy_store.get_home(LEGACY_GROUP_ID)["members"][0]["status"] == "retired"
+    with pytest.raises(StoreError):
+        legacy_store.update(LEGACY_GROUP_ID, lambda h: h["members"][0].__setitem__("uid", 777))
+    with pytest.raises(StoreError):
+        legacy_store.update(LEGACY_GROUP_ID, lambda h: h["members"][1].__setitem__("status", "gone"))

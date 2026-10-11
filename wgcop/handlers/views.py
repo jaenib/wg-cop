@@ -7,7 +7,7 @@ from telegram.ext import CallbackContext
 from wgcop.formatting import format_expense_entry, format_signed_currency
 from wgcop.homes import home_currency, require_home
 from wgcop.keyboards import EXPENSE_LIST_LIMIT, get_main_keyboard
-from wgcop.members import _normalise_member_name, calculate_balances, chore_points_by_member
+from wgcop.members import _is_retired, _normalise_member_name, active_members, calculate_balances, chore_points_by_member, member_stats
 from wgcop.store import member_for_uid
 
 
@@ -55,8 +55,9 @@ async def standings(update: Update, context: CallbackContext) -> None:
     home = await require_home(update, context)
     if home is None:
         return
-    members = home.get("members", [])
-    if not members:
+    members = active_members(home)
+    retired = [m for m in home.get("members", []) or [] if _is_retired(m)]
+    if not members and not retired:
         await update.message.reply_text("No members recorded yet.", reply_markup=get_main_keyboard())
         return
 
@@ -69,4 +70,11 @@ async def standings(update: Update, context: CallbackContext) -> None:
         f"{name}: {chores.get(name, 0)} points, {format_signed_currency(balances.get(name, 0.0), currency)}"
         for name in ordered
     ]
+    if retired:
+        lines += ["", "Retired (records frozen):"]
+        for member in retired:
+            stats = member_stats(home, member)
+            lines.append(
+                f"  {member['name']}: {stats['chore_points']} points, {format_signed_currency(stats['balance'], currency)}"
+            )
     await update.message.reply_text("\n".join(lines), reply_markup=get_main_keyboard())

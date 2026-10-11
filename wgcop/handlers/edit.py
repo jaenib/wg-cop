@@ -18,7 +18,7 @@ from wgcop.keyboards import (
     get_edit_choice_keyboard,
     get_main_keyboard,
 )
-from wgcop.members import _match_member_name, _normalise_member_name
+from wgcop.members import _match_member_name, _normalise_member_name, active_members
 from wgcop.store import get_store, member_for_uid
 
 CANCEL_WORDS = {"cancel", "back to main menu"}
@@ -53,7 +53,7 @@ async def start_edit_entries(update: Update, context: CallbackContext) -> int:
     home = await require_home(update, context)
     if home is None:
         return ConversationHandler.END
-    members = home.get("members", []) or []
+    members = active_members(home)
     if not members:
         await update.message.reply_text("No members recorded yet.", reply_markup=get_main_keyboard())
         return ConversationHandler.END
@@ -77,7 +77,7 @@ async def edit_entries_pick_member(update: Update, context: CallbackContext) -> 
     choice = update.message.text.strip()
     if choice.lower() in CANCEL_WORDS:
         return await cancel(update, context)
-    match = _match_member_name(home["members"], choice)
+    match = _match_member_name(active_members(home), choice)
     if not match:
         await update.message.reply_text("Please choose a member from the list.")
         return EDIT_PICK_MEMBER
@@ -95,7 +95,7 @@ async def edit_entries_menu(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("Enter the corrected total (use a number).", reply_markup=ReplyKeyboardRemove())
         return EDIT_AMOUNT
     if choice == BTN_EDIT_SPLITTERS.lower():
-        member_list = ", ".join(m["name"] for m in home["members"])
+        member_list = ", ".join(m["name"] for m in active_members(home))
         await update.message.reply_text(
             "Send the updated split as comma-separated names." + (f"\nMembers: {member_list}" if member_list else ""),
             reply_markup=ReplyKeyboardRemove(),
@@ -167,7 +167,7 @@ async def edit_entries_split(update: Update, context: CallbackContext) -> int:
 
     resolved, unknown = [], []
     for name in raw_names:
-        match = _match_member_name(home["members"], name)
+        match = _match_member_name(active_members(home), name)
         if not match:
             unknown.append(name)
         elif match["name"] not in resolved:
