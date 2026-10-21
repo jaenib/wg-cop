@@ -17,7 +17,7 @@ from tests.fakes import (
     text_update,
 )
 from tests.legacy_fixture import LEGACY_GROUP_ID, legacy_data, legacy_seed
-from wgcop import store as store_mod
+from wgcop import homes as homes_mod, store as store_mod
 from wgcop.handlers import admin, chore, edit, expense, home as home_h, members, penalties, views
 from wgcop.handlers.common import open_settings, start
 from wgcop.reports import _build_weekly_report
@@ -200,13 +200,26 @@ def test_foreign_keyboard_and_lost_draft_are_refused(store):
     assert "no longer valid" in u.callback_query.message.last_reply
 
 
-def test_non_member_in_group_is_told_to_join(store):
+def test_unlinked_sender_books_in_the_group_but_needs_join_in_dm(store):
+    # The original bot let everyone in the household group book; linking is for DMs.
     ctx = FakeContext()
     u = text_update("Add Expense", STRANGER, GROUP)
-    assert run(expense.start_expense(u, ctx)) == END
-    assert "/join" in u.message.last_reply
+    assert run(expense.start_expense(u, ctx)) == EXPENSE_MODE
     u = text_update("Standings", STRANGER, GROUP)
     run(views.standings(u, ctx))
+    assert "/join" not in u.message.last_reply
+    u = text_update("Add Expense", STRANGER)
+    assert run(expense.start_expense(u, FakeContext())) == END
+    assert "/join" in u.message.last_reply
+
+
+def test_retired_member_still_in_the_group_is_told_to_join(store):
+    def retire(h):
+        return homes_mod.retire_member(h, member_by_name(h, "Thomath Sucker")["mid"])
+
+    store.update(LEGACY_GROUP_ID, retire)
+    u = text_update("Add Expense", THOMATH, GROUP)
+    assert run(expense.start_expense(u, FakeContext())) == END
     assert "/join" in u.message.last_reply
 
 
