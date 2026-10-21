@@ -30,6 +30,9 @@ class TelegramDriver(BaseRequest):
         pass
 
     async def do_request(self, url, method, request_data=None, **kwargs):
+        if "/file/bot" in url:  # File.download_to_drive of a file returned by getFile
+            self.calls.append(("download", {"url": url}))
+            return 200, b"\xff\xd8 synthetic receipt image"
         endpoint = url.rsplit("/", 1)[-1]
         params = request_data.parameters if request_data else {}
         self.calls.append((endpoint, params))
@@ -71,6 +74,10 @@ class TelegramDriver(BaseRequest):
             result = True
         elif endpoint == "getChat":
             result = self.chat(int(params["chat_id"]))
+        elif endpoint == "getFile":
+            file_id = str(params["file_id"])
+            result = {"file_id": file_id, "file_unique_id": f"u-{file_id}", "file_size": 26,
+                      "file_path": f"photos/{file_id}.jpg"}
         else:
             raise AssertionError(f"Unexpected Telegram method: {endpoint}")
         return 200, json.dumps({"ok": True, "result": result}).encode()
@@ -89,6 +96,14 @@ class TelegramDriver(BaseRequest):
                    "chat": self.chat(cid), "from": self.user(uid), "text": text}
         if text.startswith("/"):
             message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+        return Update.de_json({"update_id": self.next_update, "message": message}, bot)
+
+    def photo_update(self, bot, uid, cid):
+        self.next_update += 1
+        photo = [{"file_id": f"photo{self.next_update}", "file_unique_id": f"p{self.next_update}",
+                  "width": 800, "height": 1200}]
+        message = {"message_id": self.next_update, "date": 1750000000,
+                   "chat": self.chat(cid), "from": self.user(uid), "photo": photo}
         return Update.de_json({"update_id": self.next_update, "message": message}, bot)
 
     def callback_update(self, bot, uid, cid, message_id, data):

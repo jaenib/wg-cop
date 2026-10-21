@@ -169,9 +169,15 @@ write, re-read. Rollback = restore the archive and redeploy the old code
 
 ### Resolution
 
-Group chat: the home registered for that chat (non-members are told to
+Group chat: the home registered for that chat; anyone posting there may book,
+linked or not, as with the single-home bot (only a retired member is told to
 `/join`). Private chat: the caller's single home, else their stored selection
 (`Settings -> Switch Home`), else an inline picker.
+
+Regression fixed after release: the first rule required a linked profile in
+the group too, which locked out an original member whose account migration
+could not link, and the leftover-text handler (#52) dropped drafts waiting for
+a button tap. `tests/test_original_home_contract.py` pins both.
 
 ### Joining (no invite codes)
 

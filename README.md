@@ -39,8 +39,14 @@ A home is bound to its Telegram group; the group's chat id is the home's id.
   confirms with the button. The bot first sends them a JSON archive of the home
   by private message, then removes the home with all its bookkeeping, roles and
   settings. The group can start over with `/newhome`.
-- **Join**: send `/join` in the group. Choose "I'm new" to be added under your
-  Telegram name, or "I am <profile>" to claim an existing unlinked profile.
+- **Booking in the group**: anyone who posts in the home's group can add
+  expenses and chores and see the books there, linked or not, as with the
+  original single-home bot. A member who retired from the home is the
+  exception.
+- **Join**: send `/join` in the group to link your Telegram account to a
+  profile; private chats and personal settings need the link. Choose "I'm
+  new" to be added under your Telegram name, or "I am <profile>" to claim an
+  existing unlinked profile.
   Claims need approval by a home administrator, who receives a DM with
   Approve/Deny and can also review requests under Admin Panel → Manage Roles
   → Join Requests. In a private chat, `/join` finds homes whose group you are
@@ -140,8 +146,11 @@ shellcheck deploy.sh
 ```
 
 Tests run offline with synthetic users and temporary storage. CI checks
-Python 3.10 and 3.12. A successful push to `main` of **jaenib/wg-cop** triggers
-automatic deployment and a service restart. Local `origin` may point to a
+Python 3.10 and 3.12. `tests/test_original_home_contract.py` drives the real
+handler stack over a migrated copy of the original household and checks that
+every original member can still book food (typed or scanned, group or private
+chat); a failure there blocks deployment. A successful push to `main` of
+**jaenib/wg-cop** triggers automatic deployment and a service restart. Local `origin` may point to a
 different fork; confirm the remote before publishing.
 
 See [maintenance and recovery instructions](docs/MAINTENANCE.md) for the active
