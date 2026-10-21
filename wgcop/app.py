@@ -37,6 +37,7 @@ from wgcop.handlers.chore import (
     start_chore,
 )
 from wgcop.handlers.common import (
+    awaiting_button,
     back_to_admin,
     back_to_settings,
     cancel,
@@ -238,7 +239,11 @@ def _exact(label: str):
 
 def _conversation(entry_label, states, *, allow_reentry=False, entry_filter=None):
     nav = MessageHandler(NAV_FILTER, handoff)
-    guarded = {state: [nav, *handlers] for state, handlers in states.items() if state != "__entry__"}
+    # Last in every state: a running conversation owns all text of its chat+user, so
+    # text in a button-only step (payer, split, receipt review) never reaches
+    # stray_text, which would drop the live draft. 'Cancel' is left to the fallbacks.
+    waiting = MessageHandler(filters.TEXT & ~filters.COMMAND & ~_exact(BTN_CANCEL), awaiting_button)
+    guarded = {state: [nav, *handlers, waiting] for state, handlers in states.items() if state != "__entry__"}
     timeout_state = {ConversationHandler.TIMEOUT: [MessageHandler(filters.ALL, on_timeout)]}
     return ConversationHandler(
         entry_points=[MessageHandler(entry_filter or _exact(entry_label), states["__entry__"])],
