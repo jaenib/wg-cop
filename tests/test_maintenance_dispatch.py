@@ -206,3 +206,14 @@ def test_leftover_back_after_a_restart_returns_to_the_main_menu(homes):
         assert "Nothing is in progress" in driver.messages(-100)[-1]
 
     asyncio.run(run_bot(scenario))
+
+
+def test_cancel_typed_while_the_draft_waits_for_a_tap_ends_it(homes):
+    async def scenario(app, driver):
+        for cid in (10, -100):
+            await expense_to_payer(app, driver, cid, "Dropped")
+            await message(app, driver, cid, kb.BTN_CANCEL)
+            assert not app.user_data[10].get(f"flow:{cid}")
+            assert driver.messages(cid)[-1].startswith("Cancelled")
+        assert homes.get_home(-100)["expenses"] == []
+    asyncio.run(run_bot(scenario))

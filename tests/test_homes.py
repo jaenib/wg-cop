@@ -85,7 +85,12 @@ def test_caller_requires_a_personal_account():
 def test_group_resolution(store):
     res = resolve_home(group_update("Standings", NICCI), store)
     assert res.home["id"] == str(LEGACY_GROUP_ID) and res.reason is None
-    assert resolve_home(group_update("Standings", STRANGER), store).reason == "not_member"
+    # Posting in the home's group is enough to book there (as before multi-home) ...
+    assert resolve_home(group_update("Standings", STRANGER), store).home["id"] == str(LEGACY_GROUP_ID)
+    # ... except for a member who retired from the home.
+    store.update(LEGACY_GROUP_ID, lambda h: retire_member(h, member_for_uid(h, 1005)["mid"]))
+    retired = FakeUser(1005, "Thomath")
+    assert resolve_home(group_update("Standings", retired), store).reason == "not_member"
     assert resolve_home(group_update("Standings", NICCI, chat_id=-555), store).reason == "unlinked_group"
 
 
@@ -113,8 +118,8 @@ def test_require_home_replies_with_guidance_or_picker(store):
     assert keyboard_labels(upd.message.last_markup) == ["Beach House", "WG"]
     assert upd.message.last_markup.inline_keyboard[0][0].callback_data == f"{CB_HOME_SELECT}-200"
     upd = group_update("Standings", STRANGER)
-    assert run(require_home(upd, FakeContext(), store)) is None
-    assert "/join" in upd.message.last_reply
+    assert run(require_home(upd, FakeContext(), store))["id"] == str(LEGACY_GROUP_ID)
+    assert upd.message.last_reply is None
 
 
 # -------------------------------------------------------------------- flows

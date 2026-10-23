@@ -2,8 +2,9 @@
 
 Resolution rules
 ----------------
-* Group / supergroup chat: the home registered for that chat id. Callers must
-  have access (linked member or a role holder); others are told to ``/join``.
+* Group / supergroup chat: the home registered for that chat id. Anyone who
+  posts there may book, linked or not (see ``can_use_home_group``); only a
+  member who retired from the home is told to ``/join``.
 * Private chat: the caller's single home; with several homes the stored
   selection (``Settings -> Switch Home``); otherwise a picker is shown.
 * Anonymous senders (channel posts, anonymous group admins, bots) are never
@@ -108,6 +109,20 @@ class Resolution:
     caller: Caller | None = None
 
 
+def can_use_home_group(home, uid) -> bool:
+    """May ``uid`` book in the home's own Telegram group?
+
+    Posting there proves Telegram group membership, which is all the original
+    single-home bot ever asked for. A member whose account was never linked to
+    a profile (no config id at migration, added later by name) must keep adding
+    expenses and chores there; linking (``/join``) is only needed for private
+    chats and personal settings. A member who retired from the home is not
+    let back in by staying in the group."""
+    if has_access(home, uid):
+        return True
+    return is_user_id(uid) and not any(m.get("retired_uid") == uid for m in home.get("members") or [])
+
+
 def resolve_home(update, store=None) -> Resolution:
     store = store or get_store()
     caller = caller_from_update(update)
@@ -118,7 +133,7 @@ def resolve_home(update, store=None) -> Resolution:
         home = store.home_for_group(chat.id)
         if home is None:
             return Resolution(reason="unlinked_group", caller=caller)
-        if not has_access(home, caller.uid):
+        if not can_use_home_group(home, caller.uid):
             return Resolution(reason="not_member", caller=caller, home=None)
         return Resolution(home=home, caller=caller)
     homes = store.homes_for_user(caller.uid)
@@ -207,6 +222,8 @@ def flow_home(context, chat_id, uid, store=None) -> dict | None:
         home = store.get_home(hid)
     except StoreError:
         return None
+    if home.get("group_chat_id") == chat_id:
+        return home if can_use_home_group(home, uid) else None
     return home if has_access(home, uid) else None
 
 

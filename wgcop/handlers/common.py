@@ -164,6 +164,18 @@ async def on_timeout(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 
+async def awaiting_button(update: Update, context: CallbackContext) -> None:
+    """Text while a running draft waits for a tap on its inline keyboard (payer, split, receipt).
+
+    The conversation keeps this text so the draft survives; otherwise it would reach
+    ``stray_text``, which drops the draft as a leftover and the next tap finds it gone.
+    Returning None keeps the conversation in its current state. Groups stay quiet."""
+    message = update.effective_message
+    if message is not None and not is_group_chat(update.effective_chat):
+        await message.reply_text("Please tap one of the buttons above to continue, or send /cancel.")
+    return None
+
+
 STRAY_LABELS = {"back"}  # conversation-internal buttons that mean nothing outside a conversation
 
 
