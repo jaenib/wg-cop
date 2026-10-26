@@ -69,8 +69,12 @@ A home is bound to its Telegram group; the group's chat id is the home's id.
 - **Standings**, **List Expenses**, **List Chores** and **Penalties** show
   records for the current home. **Redeem Penalty** records a paid penalty debt.
 - **Settings → Manage <your profile>** lets you rename your profile, edit your
-  last expense and toggle vacation status. Vacating members remain selectable
-  for expenses but appear at the bottom as a reminder about shared costs.
+  last expense (*Edit Expenses*), correct your own chores (*Edit Chores*) and
+  toggle vacation status. *Edit Chores* lists your ten most recent chore
+  entries; pick one to change its points or description or to delete it. Your
+  running total moves by the same amount, so standings and the weekly report
+  follow the correction. Vacating members remain selectable for expenses but
+  appear at the bottom as a reminder about shared costs.
   `/setstatus <name>` toggles another member's vacation status.
 - `/cancel` ends an entry. Expired or interrupted drafts should be restarted
   from the main menu.

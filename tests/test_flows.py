@@ -18,7 +18,7 @@ from tests.fakes import (
 )
 from tests.legacy_fixture import LEGACY_GROUP_ID, legacy_data, legacy_seed
 from wgcop import homes as homes_mod, store as store_mod
-from wgcop.handlers import admin, chore, edit, expense, home as home_h, members, penalties, views
+from wgcop.handlers import admin, chore, chore_edit, edit, expense, home as home_h, members, penalties, views
 from wgcop.handlers.common import open_settings, start
 from wgcop.reports import _build_weekly_report
 from wgcop.keyboards import (
@@ -26,6 +26,11 @@ from wgcop.keyboards import (
     CHORE_MINUTES,
     CHORE_USER,
     EDIT_AMOUNT,
+    EDIT_CHORE_DELETE,
+    EDIT_CHORE_DESCRIPTION,
+    EDIT_CHORE_MENU,
+    EDIT_CHORE_PICK,
+    EDIT_CHORE_POINTS,
     EDIT_MENU,
     EDIT_SPLIT,
     EXPENSE_AMOUNT,
@@ -285,7 +290,7 @@ def test_penalties_view_and_redeem(store):
 # ------------------------------------------------------------------ edit
 def test_edit_split_and_amount(store):
     ctx = FakeContext()
-    assert run(edit.start_edit_entries(text_update("Edit Entries", NICCI), ctx)) == EDIT_MENU
+    assert run(edit.start_edit_entries(text_update("Edit Expenses", NICCI), ctx)) == EDIT_MENU
     assert run(edit.edit_entries_menu(text_update("Splitters", NICCI), ctx)) == EDIT_SPLIT
     u = text_update("Nicci Lopez, Bob", NICCI)
     assert run(edit.edit_entries_split(u, ctx)) == EDIT_SPLIT
@@ -293,11 +298,99 @@ def test_edit_split_and_amount(store):
     assert run(edit.edit_entries_split(text_update("nicci lopez, Thomath Sucker", NICCI), ctx)) == END
     assert home_of(store)["expenses"][0]["split_with"] == ["Nicci Lopez", "Thomath Sucker"]
 
-    assert run(edit.start_edit_entries(text_update("Edit Entries", NICCI), ctx)) == EDIT_MENU
+    assert run(edit.start_edit_entries(text_update("Edit Expenses", NICCI), ctx)) == EDIT_MENU
     assert run(edit.edit_entries_menu(text_update("Amount", NICCI), ctx)) == EDIT_AMOUNT
     assert run(edit.edit_entries_amount(text_update("-1", NICCI), ctx)) == EDIT_AMOUNT
     assert run(edit.edit_entries_amount(text_update("75,5", NICCI), ctx)) == END
     assert home_of(store)["expenses"][0]["amount"] == 75.5
+
+
+def test_edit_own_chores_points_description_and_delete(store):
+    ctx = FakeContext()
+    u = text_update("Edit Chores", ADMIN)  # admin role but no linked profile
+    assert run(chore_edit.start_edit_chores(u, ctx)) == END
+    assert "/join" in u.message.last_reply
+    u = text_update("Edit Chores", THOMATH)  # linked, but only a legacy total without log entries
+    assert run(chore_edit.start_edit_chores(u, ctx)) == END
+    assert "No chore entries recorded for Thomath Sucker" in u.message.last_reply
+
+    # only the caller's own entries, newest first
+    run(chore.handle_chore(text_update("/chore 4 bins", NICCI), FakeContext(args=["4", "bins"])))
+    u = text_update("Edit Chores", NICCI)
+    assert run(chore_edit.start_edit_chores(u, ctx)) == EDIT_CHORE_PICK
+    labels = keyboard_labels(u.message.last_markup)
+    assert len(labels) == 3 and labels[-1] == "Cancel"  # two of Nicci's entries, not Janidputzä's
+    assert labels[0].startswith("1. ") and labels[0].endswith("+4 pts – bins")
+    assert labels[1] == "2. 2026-09-20 18:00 · +2 pts – kitchen"
+    u = text_update("9. nothing", NICCI)
+    assert run(chore_edit.edit_chores_pick(u, ctx)) == EDIT_CHORE_PICK
+    assert "tap one of the entries" in u.message.last_reply
+    u = text_update(labels[1], NICCI)
+    assert run(chore_edit.edit_chores_pick(u, ctx)) == EDIT_CHORE_MENU
+    assert "kitchen" in u.message.last_reply
+    assert keyboard_labels(u.message.last_markup) == ["Points", "Description", "Delete", "Back", "Cancel"]
+
+    # points are validated; the running total moves by the difference
+    assert run(chore_edit.edit_chores_menu(text_update("Points", NICCI), ctx)) == EDIT_CHORE_POINTS
+    u = text_update("0", NICCI)
+    assert run(chore_edit.edit_chores_points(u, ctx)) == EDIT_CHORE_POINTS
+    assert run(chore_edit.edit_chores_points(text_update("abc", NICCI), ctx)) == EDIT_CHORE_POINTS
+    u = text_update("5", NICCI)
+    assert run(chore_edit.edit_chores_points(u, ctx)) == END
+    assert "Points updated." in u.message.last_reply and "Your total is now 19 points" in u.message.last_reply
+    home = home_of(store)
+    assert home["chores"]["Nicci Lopez"] == 19  # 12 + 4 (bins) + (5 - 2)
+    assert home["chore_log"][0]["points"] == 5 and home["chore_log"][0]["description"] == "kitchen"
+    assert ctx.user_data.get(f"flow:{NICCI.id}") is None  # draft cleared
+
+    # description: a typed number picks too, Back returns to the menu, '-' clears
+    run(chore_edit.start_edit_chores(text_update("Edit Chores", NICCI), ctx))
+    assert run(chore_edit.edit_chores_pick(text_update("2", NICCI), ctx)) == EDIT_CHORE_MENU
+    assert run(chore_edit.edit_chores_menu(text_update("Description", NICCI), ctx)) == EDIT_CHORE_DESCRIPTION
+    u = text_update("Back", NICCI)
+    assert run(chore_edit.edit_chores_description(u, ctx)) == EDIT_CHORE_MENU
+    run(chore_edit.edit_chores_menu(text_update("Description", NICCI), ctx))
+    u = text_update("-", NICCI)
+    assert run(chore_edit.edit_chores_description(u, ctx)) == END
+    assert "Description removed." in u.message.last_reply
+    assert home_of(store)["chore_log"][0]["description"] == ""
+    assert home_of(store)["chores"]["Nicci Lopez"] == 19  # untouched
+
+    # Back from the menu reopens the list; Cancel leaves without writing
+    run(chore_edit.start_edit_chores(text_update("Edit Chores", NICCI), ctx))
+    run(chore_edit.edit_chores_pick(text_update("1", NICCI), ctx))
+    assert run(chore_edit.edit_chores_menu(text_update("Back", NICCI), ctx)) == EDIT_CHORE_PICK
+    run(chore_edit.edit_chores_pick(text_update("1", NICCI), ctx))
+    assert run(chore_edit.edit_chores_menu(text_update("Cancel", NICCI), ctx)) == END
+    assert ctx.user_data.get(f"flow:{NICCI.id}") is None
+
+    # an entry that changed underneath the draft is never edited blindly
+    run(chore_edit.start_edit_chores(text_update("Edit Chores", NICCI), ctx))
+    run(chore_edit.edit_chores_pick(text_update("1", NICCI), ctx))
+    run(chore_edit.edit_chores_menu(text_update("Points", NICCI), ctx))
+    store.update(LEGACY_GROUP_ID, lambda h: h["chore_log"].pop(2))  # the "bins" entry goes elsewhere
+    u = text_update("7", NICCI)
+    assert run(chore_edit.edit_chores_points(u, ctx)) == END
+    assert "nothing was changed" in u.message.last_reply
+    assert home_of(store)["chores"]["Nicci Lopez"] == 19 and len(home_of(store)["chore_log"]) == 2
+
+    # delete needs confirmation; the points leave the total and the log
+    run(chore_edit.start_edit_chores(text_update("Edit Chores", NICCI), ctx))
+    run(chore_edit.edit_chores_pick(text_update("1", NICCI), ctx))  # now the kitchen entry (5 pts)
+    u = text_update("Delete", NICCI)
+    assert run(chore_edit.edit_chores_menu(u, ctx)) == EDIT_CHORE_DELETE
+    assert keyboard_labels(u.message.last_markup) == ["Yes, delete", "Back"]
+    u = text_update("Back", NICCI)
+    assert run(chore_edit.edit_chores_delete(u, ctx)) == EDIT_CHORE_MENU
+    run(chore_edit.edit_chores_menu(text_update("Delete", NICCI), ctx))
+    u = text_update("sure", NICCI)
+    assert run(chore_edit.edit_chores_delete(u, ctx)) == EDIT_CHORE_DELETE
+    u = text_update("Yes, delete", NICCI)
+    assert run(chore_edit.edit_chores_delete(u, ctx)) == END
+    assert "Entry deleted." in u.message.last_reply and "Your total is now 14 points" in u.message.last_reply
+    home = home_of(store)
+    assert home["chores"]["Nicci Lopez"] == 14
+    assert [e["member"] for e in home["chore_log"]] == ["Janidputzä"]
 
 
 # --------------------------------------------------------------- members
@@ -443,6 +536,11 @@ def test_settings_menu_reflects_role_and_homes(store):
     u = text_update("Settings", NICCI)
     run(open_settings(u, ctx))
     assert keyboard_labels(u.message.last_markup) == ["Manage Nicci Lopez", "Back to Main Menu"]
+    u = text_update("Manage Nicci Lopez", NICCI)
+    run(members.open_manage_self(u, ctx))
+    assert keyboard_labels(u.message.last_markup) == [
+        "Set Vacation Status", "Edit Expenses", "Edit Chores", "Change Username", "Back to Settings"
+    ]
     u = text_update("Settings", ADMIN)
     run(open_settings(u, ctx))
     assert "Admin Panel" in keyboard_labels(u.message.last_markup)

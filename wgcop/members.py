@@ -155,6 +155,26 @@ def _rename_member_in_data(data: dict, old_name: str, new_name: str) -> None:
         ]
 
 
+def _chore_key(chores: dict, member: str) -> str:
+    """The key under which ``member``'s total is booked (legacy keys were free text), else the name itself."""
+    norm = _normalise_member_name(member)
+    return next((key for key in chores if _normalise_member_name(key) == norm), member)
+
+
+def chore_points_for(data, member: str) -> int:
+    """A member's chore total, summed like ``member_stats`` does."""
+    norm = _normalise_member_name(member)
+    return sum(int(p or 0) for raw, p in (data.get("chores", {}) or {}).items() if _normalise_member_name(raw) == norm)
+
+
+def adjust_chore_points(data, member: str, delta: int) -> int:
+    """Move a member's chore total by ``delta`` (never below zero). Returns the new total; caller persists."""
+    chores = data.setdefault("chores", {})
+    key = _chore_key(chores, member)
+    chores[key] = max(0, int(chores.get(key, 0) or 0) + delta)
+    return chore_points_for(data, member)
+
+
 def add_chore_entry(data, member: str, points: int, description: str | None = None, tz=None):
     """Append a chore log entry and bump the member's total. Caller persists."""
     entry = {
