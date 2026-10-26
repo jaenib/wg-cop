@@ -217,3 +217,29 @@ def test_cancel_typed_while_the_draft_waits_for_a_tap_ends_it(homes):
             assert driver.messages(cid)[-1].startswith("Cancelled")
         assert homes.get_home(-100)["expenses"] == []
     asyncio.run(run_bot(scenario))
+
+
+def test_edit_chores_corrects_only_the_callers_entry_and_survives_handoff(homes):
+    async def scenario(app, driver):
+        for text in (kb.BTN_ADD_CHORE, "Alice", "30", "Cleaned kitchen"):   # booked in the group
+            await message(app, driver, -100, text)
+        assert homes.get_home(-100)["chores"]["Alice"] == 2
+        await message(app, driver, 10, kb.BTN_EDIT_CHORES)                   # corrected from the private chat
+        assert driver.messages(10)[-1].startswith("Your last 1 chore entry")
+        await message(app, driver, 10, "1")
+        await message(app, driver, 10, kb.BTN_CHORE_POINTS)
+        await message(app, driver, 10, kb.BTN_SETTINGS)                      # a menu button mid-draft drops it
+        assert not app.user_data[10].get("flow:10")
+        await message(app, driver, 10, "4")                                  # leftover text, nothing edited
+        assert homes.get_home(-100)["chores"]["Alice"] == 2
+        await message(app, driver, 10, kb.BTN_EDIT_CHORES)
+        await message(app, driver, 10, "1")
+        await message(app, driver, 10, kb.BTN_CHORE_POINTS)
+        await message(app, driver, 10, "4")
+        home = homes.get_home(-100)
+        assert home["chores"]["Alice"] == 4 and home["chore_log"][0]["points"] == 4
+        assert "Your total is now 4 points" in driver.messages(10)[-1]
+        await message(app, driver, 20, kb.BTN_EDIT_CHORES, uid=20)           # Bob has nothing of his own
+        assert "No chore entries recorded for Bob" in driver.messages(20)[-1]
+        assert not app.user_data[20].get("flow:20")
+    asyncio.run(run_bot(scenario))

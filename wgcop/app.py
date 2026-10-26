@@ -36,6 +36,14 @@ from wgcop.handlers.chore import (
     list_chores,
     start_chore,
 )
+from wgcop.handlers.chore_edit import (
+    edit_chores_delete,
+    edit_chores_description,
+    edit_chores_menu,
+    edit_chores_pick,
+    edit_chores_points,
+    start_edit_chores,
+)
 from wgcop.handlers.common import (
     awaiting_button,
     back_to_admin,
@@ -109,7 +117,8 @@ from wgcop.keyboards import (
     BTN_CANCEL,
     BTN_CHANGE_USERNAME,
     BTN_CHECK_PENALTIES,
-    BTN_EDIT_ENTRIES,
+    BTN_EDIT_CHORES,
+    BTN_EDIT_EXPENSES,
     BTN_HOME_SETTINGS,
     BTN_LIST_CHORES,
     BTN_LIST_EXPENSES,
@@ -134,6 +143,11 @@ from wgcop.keyboards import (
     CHORE_MINUTES,
     CHORE_USER,
     EDIT_AMOUNT,
+    EDIT_CHORE_DELETE,
+    EDIT_CHORE_DESCRIPTION,
+    EDIT_CHORE_MENU,
+    EDIT_CHORE_PICK,
+    EDIT_CHORE_POINTS,
     EDIT_MENU,
     EDIT_PICK_MEMBER,
     EDIT_SPLIT,
@@ -176,9 +190,9 @@ CONVERSATION_TIMEOUT = 300
 NAV_LABELS = (
     BTN_ADD_EXPENSE, BTN_ADD_CHORE, BTN_LIST_EXPENSES, BTN_LIST_CHORES, BTN_STANDINGS, BTN_PENALTIES,
     BTN_SETTINGS, BTN_BACK_MAIN, BTN_BACK_SETTINGS, BTN_BACK_ADMIN, BTN_CHECK_PENALTIES,
-    BTN_REDEEM_PENALTY, BTN_SWITCH_HOME, BTN_ADMIN_PANEL, BTN_SET_VACATION, BTN_EDIT_ENTRIES,
-    BTN_CHANGE_USERNAME, BTN_MEMBER_MANAGEMENT, BTN_MANAGE_WEEKLY, BTN_ADJUST_PENALTIES, BTN_SET_HOECK,
-    BTN_SYSTEM_OVERVIEW, BTN_SET_REPORT_TIME, BTN_TOGGLE_WEEKLY, BTN_TRIGGER_WEEKLY,
+    BTN_REDEEM_PENALTY, BTN_SWITCH_HOME, BTN_ADMIN_PANEL, BTN_SET_VACATION, BTN_EDIT_EXPENSES,
+    BTN_EDIT_CHORES, BTN_CHANGE_USERNAME, BTN_MEMBER_MANAGEMENT, BTN_MANAGE_WEEKLY, BTN_ADJUST_PENALTIES,
+    BTN_SET_HOECK, BTN_SYSTEM_OVERVIEW, BTN_SET_REPORT_TIME, BTN_TOGGLE_WEEKLY, BTN_TRIGGER_WEEKLY,
     BTN_MANAGE_ROLES, BTN_HOME_SETTINGS,
 )
 NAV_FILTER = (
@@ -380,12 +394,21 @@ def _register_conversations(app: Application) -> None:
         CHANGE_USERNAME_NEW: _text_steps(do_change_username),
     }, allow_reentry=True))
 
-    app.add_handler(_conversation(BTN_EDIT_ENTRIES, {
+    app.add_handler(_conversation(BTN_EDIT_EXPENSES, {
         "__entry__": start_edit_entries,
         EDIT_PICK_MEMBER: _text_steps(edit_entries_pick_member, cancel_first=False),
         EDIT_MENU: _text_steps(edit_entries_menu, cancel_first=False),
         EDIT_AMOUNT: _text_steps(edit_entries_amount, cancel_first=False),
         EDIT_SPLIT: _text_steps(edit_entries_split, cancel_first=False),
+    }))
+
+    app.add_handler(_conversation(BTN_EDIT_CHORES, {
+        "__entry__": start_edit_chores,
+        EDIT_CHORE_PICK: _text_steps(edit_chores_pick, cancel_first=False),
+        EDIT_CHORE_MENU: _text_steps(edit_chores_menu, cancel_first=False),
+        EDIT_CHORE_POINTS: _text_steps(edit_chores_points, cancel_first=False),
+        EDIT_CHORE_DESCRIPTION: _text_steps(edit_chores_description, cancel_first=False),
+        EDIT_CHORE_DELETE: _text_steps(edit_chores_delete, cancel_first=False),
     }))
 
     app.add_handler(_conversation(BTN_REDEEM_PENALTY, {

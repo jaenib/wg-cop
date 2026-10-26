@@ -19,11 +19,11 @@ def test_main_builds_expected_handlers_and_jobs(monkeypatch, tmp_path):
 
     handlers = app.handlers[0]
     conversations = [h for h in handlers if isinstance(h, ConversationHandler)]
-    assert len(handlers) == 46  # + /deletehome command, its confirmation callback, stray-text fallback
-    assert len(conversations) == 11
+    assert len(handlers) == 47  # + /deletehome command, its confirmation callback, stray-text fallback, Edit Chores
+    assert len(conversations) == 12
     assert all(c.conversation_timeout == 300 for c in conversations)
     # conversations are registered before every plain handler (see app.handoff)
-    assert all(isinstance(h, ConversationHandler) for h in handlers[:11])
+    assert all(isinstance(h, ConversationHandler) for h in handlers[:12])
     # handoff relies on these ConversationHandler internals of the pinned PTB release
     for attr in ("_get_key", "_conversations", "_update_state", "timeout_jobs", "_timeout_jobs_lock"):
         assert hasattr(conversations[0], attr), attr

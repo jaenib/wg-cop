@@ -5,7 +5,9 @@ from wgcop.members import (
     _match_member_name,
     _normalise_member_name,
     _rename_member_in_data,
+    adjust_chore_points,
     calculate_balances,
+    chore_points_for,
 )
 
 
@@ -63,3 +65,14 @@ def test_rename_member_touches_every_structure():
     assert data["chore_log"][0]["member"] == "Alicia"
     assert data["expenses"][0]["payer"] == "Alicia"
     assert data["expenses"][0]["split_with"] == ["Alicia", "Bob"]
+
+
+def test_adjust_chore_points_uses_the_booked_key_and_never_goes_negative():
+    data = {"chores": {"alice": 3}}  # legacy free-text key
+    assert adjust_chore_points(data, "Alice", 2) == 5
+    assert data["chores"] == {"alice": 5}
+    assert adjust_chore_points(data, "Alice", -9) == 0
+    assert adjust_chore_points(data, "Bob", 1) == 1  # no total yet: booked under the given name
+    assert data["chores"] == {"alice": 0, "Bob": 1}
+    assert chore_points_for({"chores": {"Alice": 2, "alice": 1}}, "ALICE") == 3
+    assert chore_points_for({}, "Nobody") == 0

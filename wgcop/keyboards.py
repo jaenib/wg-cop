@@ -34,7 +34,8 @@ BTN_SWITCH_HOME = "Switch Home"
 BTN_ADMIN_PANEL = "Admin Panel"
 BTN_MANAGE_PREFIX = "Manage "          # "Manage <profile name>"
 BTN_SET_VACATION = "Set Vacation Status"
-BTN_EDIT_ENTRIES = "Edit Entries"
+BTN_EDIT_EXPENSES = "Edit Expenses"
+BTN_EDIT_CHORES = "Edit Chores"
 BTN_CHANGE_USERNAME = "Change Username"
 
 BTN_MEMBER_MANAGEMENT = "Member Management"
@@ -51,6 +52,12 @@ BTN_TRIGGER_WEEKLY = "Trigger Weekly Report"
 
 BTN_EDIT_AMOUNT = "Amount"
 BTN_EDIT_SPLITTERS = "Splitters"
+
+# Edit Chores submenu (conversation-internal choices)
+BTN_CHORE_POINTS = "Points"
+BTN_CHORE_DESCRIPTION = "Description"
+BTN_CHORE_DELETE = "Delete"
+BTN_CHORE_DELETE_CONFIRM = "Yes, delete"
 
 # Manage Roles submenu (conversation-internal choices, not navigation labels)
 BTN_ROLE_ADD_ADMIN = "Add Admin"
@@ -113,6 +120,7 @@ EXPENSE_LIST_LIMIT = 20
 CHORE_USER, CHORE_MINUTES, CHORE_DESCRIPTION = range(3)
 MANAGE_MEMBER, MANAGE_MEMBER_ACTION, MANAGE_MEMBER_ADD = range(3)
 EDIT_PICK_MEMBER, EDIT_MENU, EDIT_AMOUNT, EDIT_SPLIT = range(4)
+EDIT_CHORE_PICK, EDIT_CHORE_MENU, EDIT_CHORE_POINTS, EDIT_CHORE_DESCRIPTION, EDIT_CHORE_DELETE = range(5)
 REDEEM_MEMBER, REDEEM_COUNT = range(2)
 ADMIN_PENALTY_MEMBER, ADMIN_PENALTY_COUNT = range(2)
 ADMIN_HOECK_DATE = 0  # single-state conv
@@ -141,6 +149,10 @@ def get_main_keyboard():
 
 def get_cancel_keyboard():
     return ReplyKeyboardMarkup([[KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
+
+
+def get_back_cancel_keyboard():
+    return ReplyKeyboardMarkup([[KeyboardButton(BTN_BACK), KeyboardButton(BTN_CANCEL)]], resize_keyboard=True)
 
 
 def get_member_keyboard(home):
@@ -188,7 +200,7 @@ def get_weekly_report_keyboard():
 
 def get_manage_self_keyboard():
     return ReplyKeyboardMarkup(
-        _rows(BTN_SET_VACATION, BTN_EDIT_ENTRIES, BTN_CHANGE_USERNAME, BTN_BACK_SETTINGS),
+        _rows(BTN_SET_VACATION, BTN_EDIT_EXPENSES, BTN_EDIT_CHORES, BTN_CHANGE_USERNAME, BTN_BACK_SETTINGS),
         resize_keyboard=True,
     )
 
@@ -205,6 +217,21 @@ def get_edit_choice_keyboard():
         _rows(BTN_EDIT_AMOUNT, BTN_EDIT_SPLITTERS, BTN_CANCEL),
         resize_keyboard=True,
     )
+
+
+def get_edit_chore_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_CHORE_POINTS), KeyboardButton(BTN_CHORE_DESCRIPTION)],
+            [KeyboardButton(BTN_CHORE_DELETE)],
+            [KeyboardButton(BTN_BACK), KeyboardButton(BTN_CANCEL)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_confirm_delete_keyboard():
+    return ReplyKeyboardMarkup(_rows(BTN_CHORE_DELETE_CONFIRM, BTN_BACK), resize_keyboard=True)
 
 
 def get_roles_keyboard():
